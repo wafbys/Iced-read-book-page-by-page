@@ -1,207 +1,126 @@
 # PDF Book Analyzer
 
-逐页分析 PDF 书籍，用 **DeepSeek** 提取知识点并生成阶段性摘要与最终总结。
+逐页用 **DeepSeek Flash** 提取知识点，全书用 **Pro** 生成一篇带页码的 Markdown 总结。
 
 基于 [echohive42/AI-reads-books-page-by-page](https://github.com/echohive42/AI-reads-books-page-by-page) 改造。
 
-## 功能
-
-- 命令行指定 PDF 文件
-- 逐页知识点提取 + 阶段 / 最终摘要
-- API Key **只从环境变量读取**，不写进项目
-- DeepSeek OpenAI 兼容接口（默认 **V4 Flash**）
-- Flash / Pro 共用同一 Key，用 `--model` 切换
-- **真正续跑**：`knowledge.json` 记录 `next_page`，中断后从下一页继续
-- 文字层过短的页面**本地跳过**（无 OCR；扫描件不会白烧 API）
-- 长知识点库**分块摘要再合并**，降低上下文爆掉风险
-- API 限流 / 网络错误自动重试；默认关闭 thinking 以稳住 JSON、省成本
-- `--fresh` 清空该书旧结果后重跑
-
-> **无 OCR**：只读 PDF 文字层。扫描件请先 OCR 成可选中文字的 PDF，或换电子版。
-
-## 环境要求
-
-- Python 3.10+
-- [DeepSeek API Key](https://platform.deepseek.com/api_keys)（环境变量 `DEEPSEEK_API_KEY`）
-
-## 模型（Flash / Pro）
-
-官方 API 文档：https://api-docs.deepseek.com/
-
-| 模型 ID | 说明 | 默认 |
-|---------|------|------|
-| `deepseek-v4-flash` | 更快、更便宜（当前为 V4-Flash-0731） | ✅ 默认 |
-| `deepseek-v4-pro` | 更强、更贵 | 可选 |
-
-要点：
-
-- **同一个** `DEEPSEEK_API_KEY` 可用于 Flash 和 Pro
-- **同一个** `base_url`：`https://api.deepseek.com`
-- 切换方式：只改请求里的 **model**（本项目的 `--model` / `--analysis-model`）
-- 旧名 `deepseek-chat` / `deepseek-reasoner` 已进入淘汰路径，本项目不再使用
-
-## 快速开始
-
-### 1. 安装依赖
+## 怎么用
 
 ```bash
 pip install -r requirements.txt
+
+# 设置 Key（不要写进项目）—— PowerShell 示例
+$env:DEEPSEEK_API_KEY = "sk-..."
+
+python read_books.py your_book.pdf
 ```
 
-### 2. 配置 API Key（不要放进项目）
+**只有一个参数：PDF 路径或文件名。**
 
-Key 只通过环境变量 `DEEPSEEK_API_KEY` 传入；**不要**写进代码或提交到 git。仓库已忽略 `.env`。
+| 固定策略 | 值 |
+|----------|-----|
+| 逐页抽取 | `deepseek-v4-flash` |
+| 全书总结 | `deepseek-v4-pro` |
+| 产出目录 | 全部在 `book_analysis/`（无子目录） |
 
-#### Windows — 当前会话（关掉窗口即失效）
+同一书文件：
 
-**PowerShell**
+```
+book_analysis/
+  书名.pdf                 # PDF 副本
+  书名_knowledge.json      # 进度 + 知识点（机器用）
+  书名.md                  # 给人读的总结
+  书名_gold.md             # 可选：人工金标准 / 润色稿
+```
+
+## 重复执行
+
+| 状态 | 行为 |
+|------|------|
+| 抽取未完成 | 从 JSON 的 `next_page` **续跑** |
+| 抽取完成 + 总结已存在 | **跳过**，提示已完成 |
+| 抽取完成 + 无总结 | 只生成总结 |
+| 想重写总结 | **先删除** `book_analysis/<书名>.md`，再执行 |
+| 想重抽全书 | **先删除** `book_analysis/<书名>_knowledge.json`（及可选 md） |
+| 人工润色迭代 | 把满意的 md 另存为 `书名_gold.md`，删 `书名.md` 再跑 → 总结会参考金标准 |
+
+## 配置 API Key
+
+Key 只走环境变量 `DEEPSEEK_API_KEY`。
+
+**会话（关窗口失效）**
 
 ```powershell
 $env:DEEPSEEK_API_KEY = "sk-..."
-# 验证
-echo $env:DEEPSEEK_API_KEY
 ```
-
-**CMD**
 
 ```cmd
 set DEEPSEEK_API_KEY=sk-...
-REM 验证（注意：set 与变量名之间不要多空格）
-echo %DEEPSEEK_API_KEY%
 ```
 
-#### Windows — 永久（用户级，新开终端生效）
-
-**PowerShell（推荐）**
+**永久（用户级）**
 
 ```powershell
-# 写入当前用户环境变量（永久）
-[System.Environment]::SetEnvironmentVariable(
-  "DEEPSEEK_API_KEY",
-  "sk-...",
-  "User"
-)
-
-# 让「当前这个」PowerShell 窗口立刻也能用（无需重开）
-$env:DEEPSEEK_API_KEY = [System.Environment]::GetEnvironmentVariable(
-  "DEEPSEEK_API_KEY", "User"
-)
+[System.Environment]::SetEnvironmentVariable("DEEPSEEK_API_KEY", "sk-...", "User")
+$env:DEEPSEEK_API_KEY = [System.Environment]::GetEnvironmentVariable("DEEPSEEK_API_KEY", "User")
 ```
 
-**CMD**
-
 ```cmd
-REM 写入当前用户环境变量（永久）；新开 CMD/PowerShell 后生效
 setx DEEPSEEK_API_KEY "sk-..."
-
-REM 注意：setx 不会更新「当前已打开」的窗口，请新开一个终端再跑程序
+REM 需新开终端
 ```
 
-也可用图形界面：  
-`设置 → 系统 → 关于 → 高级系统设置 → 环境变量 → 用户变量 → 新建`  
-变量名 `DEEPSEEK_API_KEY`，变量值为你的 Key → 确定后**重新打开**终端。
+## 输出
 
-#### 删除 / 取消永久设置
-
-```powershell
-# PowerShell：删除用户级变量
-[System.Environment]::SetEnvironmentVariable("DEEPSEEK_API_KEY", $null, "User")
-Remove-Item Env:DEEPSEEK_API_KEY -ErrorAction SilentlyContinue
-```
-
-```cmd
-REM CMD：清除用户级（setx 无法直接删，用 PowerShell 更干净；或用系统设置 GUI 删除）
-setx DEEPSEEK_API_KEY ""
-```
-
-#### macOS / Linux（会话）
-
-```bash
-export DEEPSEEK_API_KEY="sk-..."
-```
-
-永久可写入 `~/.bashrc` / `~/.zshrc` 等同名 `export` 行。
-
-### 3. 运行
-
-```bash
-# 默认：全书用 deepseek-v4-flash
-python read_books.py infinite_math.pdf
-
-# 试跑：前 3 页（默认不写阶段摘要）
-python read_books.py infinite_math.pdf --pages 3
-
-# 只跑前 10 页，并每 5 页出一次阶段摘要
-python read_books.py infinite_math.pdf --pages 10 --interval 5
-
-# 中断后直接再跑同一命令 → 从 next_page 续跑
-python read_books.py infinite_math.pdf --pages 10
-
-# 全流程用 Pro
-python read_books.py book.pdf --model deepseek-v4-pro --analysis-model deepseek-v4-pro
-
-# 逐页用 Flash 省钱，摘要用 Pro
-python read_books.py book.pdf --model deepseek-v4-flash --analysis-model deepseek-v4-pro
-
-# 清空该书旧结果重跑
-python read_books.py book.pdf --fresh
-```
-
-### 常用参数
-
-| 参数 | 说明 | 默认 |
-|------|------|------|
-| `pdf` | PDF 路径或文件名（必填） | — |
-| `--interval N` | 每 N 页生成阶段摘要；`0` 关闭（更省 API） | `0`（关闭） |
-| `--pages N` | 只处理前 N 页（`N >= 1`）；省略则全书 | 全书 |
-| `--model` | 逐页分析模型 | `deepseek-v4-flash` |
-| `--analysis-model` | 摘要模型 | `deepseek-v4-flash` |
-| `--fresh` | 清空该书已有 knowledge / summaries | 关 |
-
-```bash
-python read_books.py -h
-```
-
-运行时传入的 `--model` / `--analysis-model` 会覆盖上述默认值；Key 不变。
-
-## 续跑与输出
-
-`book_analysis/knowledge_bases/<书名>_knowledge.json` 结构示例：
+JSON 示例（`书名_knowledge.json`）：
 
 ```json
 {
   "knowledge": [
-    {"page": 3, "text": "知识点……"},
-    {"page": 3, "text": "另一条……"},
-    {"page": 5, "text": "……"}
+    {"page": 7, "text": "……"}
   ],
-  "next_page": 12
+  "next_page": 84,
+  "skipped": {
+    "blank": [],
+    "no_content": [1, 2, 3],
+    "parse_error": []
+  }
 }
 ```
 
-- `page`：PDF 阅读器中的页码（**从 1 起**），与对照阅读一致
-- `next_page`：下一待处理页的 **0-based** 索引（已处理完前 12 页则为 `12`）
-- 再次运行同一 PDF（且不用 `--fresh`）会从该页继续，**不会**从头重复追加
-- 摘要 Markdown 中：综合总结会引用（第 N 页）；文末附**按页知识点索引**
-- 旧版无 `next_page` 的文件会被拒绝；旧版纯字符串知识点可续跑但无页码，建议 `--fresh`
+- `page`：PDF 阅读器页码（从 1 起）
+- `next_page`：下一待处理页（0-based）；等于总页数表示抽取完成
+- 读者一般**只需看** `book_analysis/<书名>.md`
 
-```
-book_analysis/
-├── pdfs/              # PDF 副本
-├── knowledge_bases/   # 知识点 + 进度 JSON
-└── summaries/         # 阶段 / 最终 Markdown 摘要
-```
+总结结构：`导读` → `分题详述`（要点带页码）→ `主题索引`（术语 → 页码）。
 
-## 项目结构
+### 质量相关实现
 
-```
-.
-├── read_books.py      # 主程序
-├── requirements.txt
-├── .env.example       # 仅变量名说明，勿填真实 Key
-├── LICENSE
-└── README.md
-```
+- **抽取（Flash，关 thinking）**
+  - 跳过纯目录/索引等；要点自洽、保术语；去重；长页截断
+  - 注入 **PDF 书签**定位当前章节
+  - 附带 **上一页要点** 作连贯上下文（禁止照抄）
+- **总结（Pro，终稿开 thinking + high effort）**
+  - 分块先「节选消化」再合并终稿；强制 bullet 带页码
+  - 终稿可参考书签目录命名分题
+  - 若存在 `书名_gold.md`，作结构/术语/遗漏参考（事实仍以知识点页码为准）
+- **读者**主要看 `book_analysis/<书名>.md`；JSON 仅进度与原料
+
+### 人工金标准怎么用
+
+1. 先正常跑出 `书名.md`，你自己改到满意  
+2. 复制为 `book_analysis/书名_gold.md`  
+3. 删除 `书名.md`，再执行 `python read_books.py 书名.pdf`  
+4. 程序只重跑总结，并参考 gold（不重抽页，除非你删了 JSON）
+
+> **无 OCR**：只读文字层。扫描件需先 OCR。  
+> **thinking 更贵更慢**：仅终稿总结开启；抽取与分块中间稿关闭。
+
+## 依赖
+
+- Python 3.10+
+- `pip install -r requirements.txt`
+- [DeepSeek API Key](https://platform.deepseek.com/api_keys)
 
 ## License
 
