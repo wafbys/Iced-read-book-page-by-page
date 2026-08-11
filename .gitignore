@@ -42,6 +42,10 @@ Thumbs.db
 # Project outputs
 book_analysis/
 
+# Local Grok session pointer (see .grok/hooks/save_session_id.py)
+.grok-session
+.grok-session.*
+
 # Local PDFs (optional: comment out if you want to track sample PDFs)
 # *.pdf
 
