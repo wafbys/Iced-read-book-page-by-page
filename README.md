@@ -11,8 +11,13 @@
 - API Key **只从环境变量读取**，不写进项目
 - DeepSeek OpenAI 兼容接口（默认 **V4 Flash**）
 - Flash / Pro 共用同一 Key，用 `--model` 切换
-- 知识点 JSON 持久化，默认支持续跑（`--fresh` 可清空重来）
-- 智能跳过目录、索引等无实质内容页
+- **真正续跑**：`knowledge.json` 记录 `next_page`，中断后从下一页继续
+- 文字层过短的页面**本地跳过**（无 OCR；扫描件不会白烧 API）
+- 长知识点库**分块摘要再合并**，降低上下文爆掉风险
+- API 限流 / 网络错误自动重试；默认关闭 thinking 以稳住 JSON、省成本
+- `--fresh` 清空该书旧结果后重跑
+
+> **无 OCR**：只读 PDF 文字层。扫描件请先 OCR 成可选中文字的 PDF，或换电子版。
 
 ## 环境要求
 
@@ -45,35 +50,101 @@ pip install -r requirements.txt
 
 ### 2. 配置 API Key（不要放进项目）
 
+Key 只通过环境变量 `DEEPSEEK_API_KEY` 传入；**不要**写进代码或提交到 git。仓库已忽略 `.env`。
+
+#### Windows — 当前会话（关掉窗口即失效）
+
+**PowerShell**
+
 ```powershell
-# Windows PowerShell（当前会话）
 $env:DEEPSEEK_API_KEY = "sk-..."
+# 验证
+echo $env:DEEPSEEK_API_KEY
 ```
 
+**CMD**
+
+```cmd
+set DEEPSEEK_API_KEY=sk-...
+REM 验证（注意：set 与变量名之间不要多空格）
+echo %DEEPSEEK_API_KEY%
+```
+
+#### Windows — 永久（用户级，新开终端生效）
+
+**PowerShell（推荐）**
+
+```powershell
+# 写入当前用户环境变量（永久）
+[System.Environment]::SetEnvironmentVariable(
+  "DEEPSEEK_API_KEY",
+  "sk-...",
+  "User"
+)
+
+# 让「当前这个」PowerShell 窗口立刻也能用（无需重开）
+$env:DEEPSEEK_API_KEY = [System.Environment]::GetEnvironmentVariable(
+  "DEEPSEEK_API_KEY", "User"
+)
+```
+
+**CMD**
+
+```cmd
+REM 写入当前用户环境变量（永久）；新开 CMD/PowerShell 后生效
+setx DEEPSEEK_API_KEY "sk-..."
+
+REM 注意：setx 不会更新「当前已打开」的窗口，请新开一个终端再跑程序
+```
+
+也可用图形界面：  
+`设置 → 系统 → 关于 → 高级系统设置 → 环境变量 → 用户变量 → 新建`  
+变量名 `DEEPSEEK_API_KEY`，变量值为你的 Key → 确定后**重新打开**终端。
+
+#### 删除 / 取消永久设置
+
+```powershell
+# PowerShell：删除用户级变量
+[System.Environment]::SetEnvironmentVariable("DEEPSEEK_API_KEY", $null, "User")
+Remove-Item Env:DEEPSEEK_API_KEY -ErrorAction SilentlyContinue
+```
+
+```cmd
+REM CMD：清除用户级（setx 无法直接删，用 PowerShell 更干净；或用系统设置 GUI 删除）
+setx DEEPSEEK_API_KEY ""
+```
+
+#### macOS / Linux（会话）
+
 ```bash
-# macOS / Linux
 export DEEPSEEK_API_KEY="sk-..."
 ```
 
-Key 只通过环境变量传入；仓库已忽略 `.env`，请勿把真实 Key 提交到 git。
+永久可写入 `~/.bashrc` / `~/.zshrc` 等同名 `export` 行。
 
 ### 3. 运行
 
 ```bash
 # 默认：全书用 deepseek-v4-flash
-python read_books.py meditations.pdf
+python read_books.py infinite_math.pdf
 
-# 只跑前 10 页，每 5 页出一次阶段摘要
-python read_books.py meditations.pdf --pages 10 --interval 5
+# 试跑：前 3 页（默认不写阶段摘要）
+python read_books.py infinite_math.pdf --pages 3
+
+# 只跑前 10 页，并每 5 页出一次阶段摘要
+python read_books.py infinite_math.pdf --pages 10 --interval 5
+
+# 中断后直接再跑同一命令 → 从 next_page 续跑
+python read_books.py infinite_math.pdf --pages 10
 
 # 全流程用 Pro
-python read_books.py meditations.pdf --model deepseek-v4-pro --analysis-model deepseek-v4-pro
+python read_books.py book.pdf --model deepseek-v4-pro --analysis-model deepseek-v4-pro
 
 # 逐页用 Flash 省钱，摘要用 Pro
-python read_books.py meditations.pdf --model deepseek-v4-flash --analysis-model deepseek-v4-pro
+python read_books.py book.pdf --model deepseek-v4-flash --analysis-model deepseek-v4-pro
 
 # 清空该书旧结果重跑
-python read_books.py path/to/book.pdf --fresh
+python read_books.py book.pdf --fresh
 ```
 
 ### 常用参数
@@ -81,8 +152,8 @@ python read_books.py path/to/book.pdf --fresh
 | 参数 | 说明 | 默认 |
 |------|------|------|
 | `pdf` | PDF 路径或文件名（必填） | — |
-| `--interval N` | 每 N 页生成阶段摘要；`0` 关闭 | `20` |
-| `--pages N` | 只处理前 N 页；省略则全书 | 全书 |
+| `--interval N` | 每 N 页生成阶段摘要；`0` 关闭（更省 API） | `0`（关闭） |
+| `--pages N` | 只处理前 N 页（`N >= 1`）；省略则全书 | 全书 |
 | `--model` | 逐页分析模型 | `deepseek-v4-flash` |
 | `--analysis-model` | 摘要模型 | `deepseek-v4-flash` |
 | `--fresh` | 清空该书已有 knowledge / summaries | 关 |
@@ -93,12 +164,31 @@ python read_books.py -h
 
 运行时传入的 `--model` / `--analysis-model` 会覆盖上述默认值；Key 不变。
 
-## 输出结构
+## 续跑与输出
+
+`book_analysis/knowledge_bases/<书名>_knowledge.json` 结构示例：
+
+```json
+{
+  "knowledge": [
+    {"page": 3, "text": "知识点……"},
+    {"page": 3, "text": "另一条……"},
+    {"page": 5, "text": "……"}
+  ],
+  "next_page": 12
+}
+```
+
+- `page`：PDF 阅读器中的页码（**从 1 起**），与对照阅读一致
+- `next_page`：下一待处理页的 **0-based** 索引（已处理完前 12 页则为 `12`）
+- 再次运行同一 PDF（且不用 `--fresh`）会从该页继续，**不会**从头重复追加
+- 摘要 Markdown 中：综合总结会引用（第 N 页）；文末附**按页知识点索引**
+- 旧版无 `next_page` 的文件会被拒绝；旧版纯字符串知识点可续跑但无页码，建议 `--fresh`
 
 ```
 book_analysis/
 ├── pdfs/              # PDF 副本
-├── knowledge_bases/   # 知识点 JSON
+├── knowledge_bases/   # 知识点 + 进度 JSON
 └── summaries/         # 阶段 / 最终 Markdown 摘要
 ```
 
