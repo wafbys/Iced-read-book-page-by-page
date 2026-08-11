@@ -4,18 +4,16 @@ PDF 书籍分析器 — 逐页提取知识点，生成一篇带页码的总结�
 用法：
   python read_books.py book.pdf
 
-固定策略：
-  - 逐页抽取：deepseek-v4-flash
-  - 全书总结：deepseek-v4-pro
-  - JSON 只作进度与知识点仓库
-  - 产出均在 book_analysis/ 同一目录：
-      <书名>.pdf / <书名>_knowledge.json / <书名>.md
-  - 可选人工金标准：book_analysis/<书名>_gold.md
-    （总结时作结构/要点参考；重写总结前仍须删除 <书名>.md）
-  - 抽页已完成且总结已存在 → 直接跳过
-  - 总结已存在又要重写 → 请先删除该 md 再执行
+质量优先策略（不计成本）：
+  - 逐页抽取与全书总结均用 deepseek-v4-pro
+  - 抽取 / 分块消化 / 终稿 / 审校 均开启 thinking
+  - 书签定位 + 邻页要点 + 下页预览 增强连贯
+  - 终稿后再做一轮编辑审校
+  - 产出：book_analysis/<书名>.pdf | _knowledge.json | .md
+  - 可选金标准：book_analysis/<书名>_gold.md
+  - 抽页完成且总结已存在 → 跳过；重写总结请先删 .md
 
-API Key 仅从环境变量 DEEPSEEK_API_KEY 读取，切勿写入项目。
+API Key 仅从环境变量 DEEPSEEK_API_KEY 读取。
 """
 
 from __future__ import annotations
@@ -26,6 +24,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -44,27 +43,31 @@ from pydantic import BaseModel, ValidationError
 from termcolor import colored
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-MODEL_EXTRACT = "deepseek-v4-flash"  # 逐页「摘要/抽取」
-MODEL_SUMMARY = "deepseek-v4-pro"  # 全书「总结」
+# 质量优先：全程 Pro
+MODEL_EXTRACT = "deepseek-v4-pro"
+MODEL_SUMMARY = "deepseek-v4-pro"
 
 MIN_PAGE_CHARS = 40
-# 分块宜略小，便于分块消化时仍能带上足够页码上下文
-SUMMARY_CHUNK_CHARS = 36_000
-MAX_PAGE_TEXT_CHARS = 12_000  # 单页过长时截断，避免噪声淹没要点
-NEIGHBOR_CONTEXT_ITEMS = 6  # 抽取时附带上页要点条数
-API_MAX_RETRIES = 5
+# Pro 长上下文：尽量少分块，整书一次吃进更好
+SUMMARY_CHUNK_CHARS = 120_000
+MAX_PAGE_TEXT_CHARS = 40_000
+NEIGHBOR_CONTEXT_ITEMS = 12  # 上页要点条数
+LOOKAHEAD_CHARS = 1_200  # 下页正文预览
+API_MAX_RETRIES = 6
 API_RETRY_BASE_SECONDS = 2.0
-# 抽取关 thinking 省钱；总结开 thinking 提质（DeepSeek V4）
-EXTRA_BODY_NO_THINKING = {"thinking": {"type": "disabled"}}
-EXTRA_BODY_THINKING = {"thinking": {"type": "enabled"}}
-EXTRACT_TEMPERATURE = 0.2
-SUMMARY_TEMPERATURE = 0.3
-# thinking 会占 completion 额度，总结需足够大的 max_tokens
-SUMMARY_MAX_TOKENS = 16_384
-SUMMARY_REASONING_EFFORT = "high"
-GOLD_MAX_CHARS = 20_000  # 注入终稿的人工金标准上限
+EXTRACT_TEMPERATURE = 0.1
+SUMMARY_TEMPERATURE = 0.2
+EXTRACT_MAX_TOKENS = 8_192
+SUMMARY_MAX_TOKENS = 32_768
+EXTRACT_REASONING_EFFORT = "high"
+SUMMARY_REASONING_EFFORT = "max"
+PARTIAL_REASONING_EFFORT = "high"
+REVIEW_REASONING_EFFORT = "max"
+GOLD_MAX_CHARS = 60_000
+EXTRACT_RETRY_ON_EMPTY = True  # 正文充实却抽到 0 条时再试一次
 
-# 所有产出平铺在同一目录，不再分子目录
+EXTRA_BODY_THINKING = {"thinking": {"type": "enabled"}}
+
 BASE_DIR = Path("book_analysis")
 
 API_KEY_SETUP_HELP = """
@@ -91,7 +94,7 @@ class Config:
     pdf_path: Path
     knowledge_path: Path
     summary_path: Path
-    gold_path: Path  # 可选：人工修订金标准 md
+    gold_path: Path
 
 
 @dataclass
@@ -109,7 +112,7 @@ class KnowledgeItem:
 @dataclass
 class KnowledgeState:
     knowledge: list[KnowledgeItem]
-    next_page: int  # 下一待处理页，0-based
+    next_page: int
     skipped_blank: list[int]
     skipped_model: list[int]
     skipped_parse: list[int]
@@ -120,66 +123,83 @@ class PageContent(BaseModel):
     knowledge: list[str]
 
 
-EXTRACT_SYSTEM_PROMPT = """你是严谨的读书笔记助手。根据**单页**正文提取可复习的知识点。
+EXTRACT_SYSTEM_PROMPT = """你是顶级学术读书笔记助手。根据**当前页**正文提取可复习、可对照原文的知识点。
 
 ## 跳过（has_content=false，knowledge=[]）
 仅当本页**几乎全是**下列内容时跳过：
 目录/章节列表、书末索引、空白、版权页、纯出版信息、纯参考文献表、纯致谢名单。
-若本页在目录之外仍有实质定义或论述，必须提取。
+若本页在目录之外仍有实质定义、命题、论证或例子，必须提取。
 
 ## 提取（has_content=true）
-关注：定义、核心命题、论证步骤、对比/权衡、方法论、重要例子、结论、对常见误区的批评。
-忽略：无信息页眉页脚、重复排版符号、纯装饰性编号（除非构成论点）。
+优先：定义、不变量/约束、核心命题、论证步骤、对比与权衡、方法论、关键例子、结论、对误区/反模式的批评、与前后文的逻辑推进。
+忽略：无信息页眉页脚、装饰符号、无论点的纯排版。
 
-若提供「目录/书签定位」或「邻页已提取要点」，仅作**连贯性参考**：
-- 用它们理解本章语境与指代，但知识点必须来自**本页正文**
-- 不要重复抄写邻页要点，除非本页有实质推进或新表述
+上下文用法（若提供书签、邻页要点、下页预览）：
+- 只用于消解指代、判断章节位置与句子是否跨页
+- **知识点必须可由本页正文支撑**；勿把邻页/下页内容写成“本页已证明”
+- 勿重复抄写邻页要点，除非本页有实质推进、限定或修正
 
-## 写法（每条一条完整句子或短段落）
-- 自洽：不看上下文也能懂；必要时补全主语
-- 具体：写清「是什么 / 为什么 / 代价或条件」，避免「作者讨论了 X」这种空话
-- 保真：术语与缩写沿用原文（可中英并列，如 无状态（Stateless））；重要短引文可保留
-- 粒度：实质页通常 3–8 条；信息少则少提，勿注水；信息密可到 10 条
-- 不要在条目里写页码（系统会标注）
-- 不要合并无关要点成一条
+## 写法（每条独立成句或短段）
+- 自洽：单独阅读也能懂
+- 具体：写清「是什么 / 为何 / 条件或代价 / 与替代方案差异」
+- 保真：术语与缩写严格沿用原文（可中英并列）；重要短引文可保留并加引号
+- 粒度：实质页通常 4–10 条；稀少则少提；密集可到 12 条；禁止注水空话
+- 不要在条目内写页码；不要把无关要点揉成一条
+- 若本页出现章节标题，可在首条用「（本章/本节：…）」点明，但仍需实质内容
 
 只返回 JSON：
 {"has_content": true或false, "knowledge": ["……", "……"]}
 """
 
-# 分块阶段：只要「带页码的节选消化」，不要主题索引（终稿再统一做）
-PARTIAL_SUMMARY_PROMPT = """你在做全书总结的**中间稿**。输入是带 [第 N 页] 的知识点片段。
+PARTIAL_SUMMARY_PROMPT = """你在做全书总结的**中间稿**（高质量优先）。输入是带 [第 N 页] 的知识点。
 
 写 Markdown 节选消化（不要主题索引，不要书名级大标题）：
-1. 用 ## / ### 按主题或原书逻辑组织本批内容
+1. 用 ## / ### 按主题或原书逻辑组织
 2. **每个 bullet 末尾必须有**（第 N 页）或（第 N–M 页）；页码只能来自输入
-3. 重要概念写清定义 + 关键属性/权衡，勿写成纯名词清单
-4. 术语沿用原文；可中英并列
-5. 本批有什么写什么，不要臆造未出现的章节
+3. 重要概念写清定义 + 属性/权衡/适用边界，禁止纯名词清单
+4. 保留关键论证链条与反例；术语沿用原文
+5. 本批有什么写什么，不臆造未出现章节
 
 只输出本节选消化正文。
 """
 
-FINAL_SUMMARY_PROMPT = """你是技术书导读作者。根据输入（知识点或中间稿）写成**一篇完整、可对照 PDF 阅读**的 Markdown 总结。
+FINAL_SUMMARY_PROMPT = """你是技术书导读作者，目标是让读者能对照 PDF 精读。根据输入写成**完整 Markdown 终稿**。
 
-## 必须结构（按此顺序，不要额外书名级重复标题）
-1. `## 导读`：用 1 短段说明全书在解决什么问题、主线结论（可含 1–3 个关键页码）
-2. `## 分题详述`：用 ### 分主题；主题名尽量贴近原书概念，按逻辑递进而非随意罗列
-3. `## 主题索引`：词条 → 页码，如 `- 无状态（Stateless）：42–43`  
-   只写词条与页码，按主题或拼音/字母大致排序；**禁止**按页倾倒全部原文知识点
+## 必须结构（顺序固定）
+1. `## 导读`：2–4 句：问题意识、主线贡献、阅读地图（可含关键页码）
+2. `## 分题详述`：### 分主题，名贴近原书；按逻辑递进
+3. `## 主题索引`：`- 词条（English）：12, 42–43` 形式；禁止按页倾倒全部原文
 
 ## 页码（硬性）
-- 输入含 [第 N 页] 或（第 N 页）；**分题详述中每个 bullet 末尾必须有出处页码**
-- 连续论述的每个独立定义/命题至少标注一次
-- 禁止编造未在输入中出现的页码；可用页码范围（第 12–14 页）
+- **分题详述每个 bullet 末尾**必须有（第 N 页）或（第 N–M 页）
+- 独立定义/命题在段落中也至少标一次页码
+- 禁止编造输入中未出现的页码
 
-## 质量
-- 前、中、后部内容都要有足够比重；中间「分类/调查」类章节须有「是什么 + 属性/权衡」，禁止纯目录体
-- 区分「定义」「约束/原则」「工程后果/反例」（若输入有）
-- 术语与缩写保真；宁可少写不可写错
-- 详实但克制：宁可结构清晰，不要空洞排比
+## 质量（硬性）
+- 前、中、后部均衡；分类/调查类章节必须有「定义 + 属性/权衡」
+- 区分定义 / 原则与约束 / 工程后果与反例
+- 术语保真；宁可少写不可写错
+- 详实、可复习，避免空泛排比
 
-只输出 Markdown 正文，不要「以下是总结」等套话。
+只输出 Markdown 正文。
+"""
+
+REVIEW_SYSTEM_PROMPT = """你是严格的技术编辑兼事实核对员。将「初稿总结」修订为更高质量的终稿。
+
+你有：
+1) 初稿 Markdown
+2) 原始知识点列表（带页码，权威事实来源）
+3) 可选：PDF 书签、人工金标准
+
+修订要求：
+- 输出**完整**修订后 Markdown（仍含 导读 / 分题详述 / 主题索引）
+- 对照知识点：**补全明显遗漏的核心概念**；删除初稿中无页码支撑的断言
+- **每个 bullet 必须有页码**；页码不足则从知识点补全
+- 统一术语与缩写；理顺章节逻辑；压缩空话
+- 若有金标准：吸收其结构与强调点，但事实以知识点为准
+- 勿引入知识点中不存在的新事实
+
+只输出修订后的 Markdown 全文。
 """
 
 
@@ -214,14 +234,11 @@ def parse_args(argv: list[str] | None = None) -> Config:
     parser = argparse.ArgumentParser(
         prog="read_books.py",
         description=(
-            "逐页用 Flash 提取知识点，全书用 Pro 生成总结。"
-            "只需指定 PDF；产出在 book_analysis/ 下同目录。"
+            "质量优先：Pro 逐页抽取 + Pro 总结（thinking）。"
+            "只需指定 PDF；产出在 book_analysis/。"
         ),
     )
-    parser.add_argument(
-        "pdf",
-        help="PDF 路径或文件名",
-    )
+    parser.add_argument("pdf", help="PDF 路径或文件名")
     args = parser.parse_args(argv)
 
     source = Path(args.pdf)
@@ -246,7 +263,7 @@ def create_client() -> OpenAI:
         print(colored("❌ 未找到环境变量 DEEPSEEK_API_KEY", "yellow"), file=sys.stderr)
         print(API_KEY_SETUP_HELP, file=sys.stderr)
         raise SystemExit(1)
-    return OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
+    return OpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL, timeout=600.0)
 
 
 def format_api_error(exc: Exception) -> str:
@@ -266,7 +283,7 @@ def format_api_error(exc: Exception) -> str:
         return (
             "DeepSeek 账户余额不足（HTTP 402）。\n"
             "  请到 https://platform.deepseek.com/ 充值。\n"
-            "  进度已保存在 knowledge JSON，充值后直接再跑同一命令即可续跑。"
+            "  进度已保存在 knowledge JSON，充值后直接再跑即可续跑。"
         )
     if status == 401:
         return "API 密钥无效（HTTP 401）。请检查 DEEPSEEK_API_KEY。"
@@ -314,15 +331,32 @@ def setup_directories(config: Config) -> None:
             shutil.copy2(config.pdf_source, config.pdf_path)
             print(colored(f"📄 已复制 PDF → {config.pdf_path}", "green"))
         else:
-            raise FileNotFoundError(
-                f"找不到 PDF：{config.pdf_source}"
-            )
+            raise FileNotFoundError(f"找不到 PDF：{config.pdf_source}")
     elif (
         config.pdf_source.exists()
         and config.pdf_source.resolve() != config.pdf_path.resolve()
     ):
         shutil.copy2(config.pdf_source, config.pdf_path)
         print(colored(f"📄 已更新 PDF 副本 → {config.pdf_path}", "green"))
+
+
+def atomic_write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=path.stem + ".", suffix=".tmp", dir=str(path.parent)
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def save_knowledge_state(config: Config, state: KnowledgeState) -> None:
@@ -341,9 +375,13 @@ def save_knowledge_state(config: Config, state: KnowledgeState) -> None:
             "no_content": _unique_sorted_pages(state.skipped_model),
             "parse_error": _unique_sorted_pages(state.skipped_parse),
         },
+        "meta": {
+            "model_extract": MODEL_EXTRACT,
+            "model_summary": MODEL_SUMMARY,
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        },
     }
-    with open(config.knowledge_path, "w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
+    atomic_write_json(config.knowledge_path, payload)
 
 
 def load_knowledge_state(config: Config) -> KnowledgeState:
@@ -388,7 +426,6 @@ def is_blank_page(page_text: str) -> bool:
 
 
 def clean_page_text(page_text: str) -> str:
-    """归一空白并限制极端长页，减少抽取噪声。"""
     text = page_text.replace("\x00", " ")
     text = re.sub(r"[ \t]+\n", "\n", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
@@ -405,7 +442,6 @@ def clean_page_text(page_text: str) -> str:
 
 
 def dedupe_knowledge(items: list[KnowledgeItem]) -> list[KnowledgeItem]:
-    """去掉完全相同的条目（同页或跨页逐字重复）。"""
     seen: set[str] = set()
     out: list[KnowledgeItem] = []
     for item in items:
@@ -418,7 +454,6 @@ def dedupe_knowledge(items: list[KnowledgeItem]) -> list[KnowledgeItem]:
 
 
 def load_pdf_toc(pdf_document: pymupdf.Document) -> list[tuple[int, str, int]]:
-    """返回 [(level, title, page_1based), ...]。无书签则空列表。"""
     try:
         raw = pdf_document.get_toc(simple=True) or []
     except Exception:
@@ -436,11 +471,9 @@ def load_pdf_toc(pdf_document: pymupdf.Document) -> list[tuple[int, str, int]]:
 def outline_context_for_page(
     toc: list[tuple[int, str, int]], pdf_page: int
 ) -> str:
-    """根据书签推断当前页所在章节路径。"""
     if not toc:
         return ""
 
-    # 不晚于当前页的最近书签链
     active: list[tuple[int, str, int]] = []
     for level, title, page in toc:
         if page > pdf_page:
@@ -449,7 +482,6 @@ def outline_context_for_page(
             active.pop()
         active.append((level, title, page))
 
-    # 即将到来的下一书签（可选）
     nxt = None
     for level, title, page in toc:
         if page > pdf_page:
@@ -459,7 +491,7 @@ def outline_context_for_page(
     if not active and not nxt:
         return ""
 
-    lines = ["【目录/书签定位】（仅供理解章节语境，知识点须来自本页正文）"]
+    lines = ["【目录/书签定位】（语境参考；知识点须来自本页正文）"]
     if active:
         path = " › ".join(t for _, t, _ in active)
         lines.append(f"- 当前位置：{path}（本节自第 {active[-1][2]} 页）")
@@ -471,31 +503,51 @@ def outline_context_for_page(
 def neighbor_context(
     state: KnowledgeState, pdf_page: int, limit: int = NEIGHBOR_CONTEXT_ITEMS
 ) -> str:
-    """上一页（及紧邻）已提取要点，帮助连贯，禁止照抄。"""
     if pdf_page <= 1 or not state.knowledge:
         return ""
-    prev_page = pdf_page - 1
-    prev_items = [i for i in state.knowledge if i.page == prev_page]
-    if not prev_items:
-        # 若上页被跳过，取更早最近一页
-        earlier = [i for i in state.knowledge if 0 < i.page < pdf_page]
-        if not earlier:
-            return ""
-        prev_page = max(i.page for i in earlier)
-        prev_items = [i for i in earlier if i.page == prev_page]
 
-    tail = prev_items[-limit:]
-    lines = [
-        f"【邻页已提取要点】（来自第 {prev_page} 页，仅供连贯；"
-        f"勿重复抄写，除非本页有新推进）"
-    ]
-    for item in tail:
-        lines.append(f"- {item.text}")
-    return "\n".join(lines)
+    # 收集前两页要点
+    pages_wanted = [pdf_page - 1]
+    if pdf_page > 2:
+        pages_wanted.insert(0, pdf_page - 2)
+
+    blocks: list[str] = []
+    for p in pages_wanted:
+        items = [i for i in state.knowledge if i.page == p]
+        if not items:
+            continue
+        tail = items[-limit:]
+        lines = [f"—— 第 {p} 页要点 ——"]
+        for item in tail:
+            lines.append(f"- {item.text}")
+        blocks.append("\n".join(lines))
+
+    if not blocks:
+        return ""
+
+    return (
+        "【邻页已提取要点】（仅供连贯与指代；勿照抄；"
+        "本页无新内容则不要重复）\n" + "\n".join(blocks)
+    )
+
+
+def lookahead_context(pdf_document: pymupdf.Document, page_num: int) -> str:
+    """下页正文开头预览，处理跨页句子。"""
+    if page_num + 1 >= pdf_document.page_count:
+        return ""
+    nxt = clean_page_text(pdf_document[page_num + 1].get_text())
+    if not nxt:
+        return ""
+    preview = nxt[:LOOKAHEAD_CHARS]
+    if len(nxt) > LOOKAHEAD_CHARS:
+        preview += "…"
+    return (
+        f"【下页正文预览】（第 {page_num + 2} 页开头，仅助理解跨页句；"
+        f"勿把下页新论点记作本页）\n{preview}"
+    )
 
 
 def load_gold_notes(gold_path: Path) -> str:
-    """可选人工金标准 / 修订笔记，注入终稿提示。"""
     if not gold_path.exists():
         return ""
     try:
@@ -511,6 +563,36 @@ def load_gold_notes(gold_path: Path) -> str:
     return text
 
 
+def _extract_once(
+    client: OpenAI,
+    user_content: str,
+    *,
+    strict_retry: bool = False,
+) -> PageContent:
+    system = EXTRACT_SYSTEM_PROMPT
+    if strict_retry:
+        system += (
+            "\n\n【加严重试】上一轮未抽出有效知识点，但本页正文较长。"
+            "请更仔细扫描定义、命题与例子；仅当确为目录/索引/空白才 has_content=false。"
+        )
+
+    completion = chat_create_with_retry(
+        client,
+        model=MODEL_EXTRACT,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_content},
+        ],
+        response_format={"type": "json_object"},
+        temperature=EXTRACT_TEMPERATURE,
+        max_tokens=EXTRACT_MAX_TOKENS,
+        reasoning_effort=EXTRACT_REASONING_EFFORT,
+        extra_body=EXTRA_BODY_THINKING,
+    )
+    raw = completion.choices[0].message.content or "{}"
+    return PageContent.model_validate(json.loads(raw))
+
+
 def process_page(
     client: OpenAI,
     config: Config,
@@ -519,6 +601,7 @@ def process_page(
     page_num: int,
     total_pages: int,
     toc: list[tuple[int, str, int]],
+    pdf_document: pymupdf.Document,
 ) -> KnowledgeState:
     pdf_page = page_num + 1
     next_state_page = page_num + 1
@@ -537,52 +620,53 @@ def process_page(
         save_knowledge_state(config, state)
         return state
 
-    ctx_parts = [
-        f"全书共 {total_pages} 页；当前为第 {pdf_page} 页。",
-    ]
+    ctx_parts = [f"全书共 {total_pages} 页；当前为第 {pdf_page} 页。"]
     outline = outline_context_for_page(toc, pdf_page)
     if outline:
         ctx_parts.append(outline)
     neighbor = neighbor_context(state, pdf_page)
     if neighbor:
         ctx_parts.append(neighbor)
+    look = lookahead_context(pdf_document, page_num)
+    if look:
+        ctx_parts.append(look)
     ctx_parts.append(f"页面正文：\n{cleaned}")
+    user_content = "\n\n".join(ctx_parts)
 
-    completion = chat_create_with_retry(
-        client,
-        model=MODEL_EXTRACT,
-        messages=[
-            {"role": "system", "content": EXTRACT_SYSTEM_PROMPT},
-            {"role": "user", "content": "\n\n".join(ctx_parts)},
-        ],
-        response_format={"type": "json_object"},
-        temperature=EXTRACT_TEMPERATURE,
-        extra_body=EXTRA_BODY_NO_THINKING,
-    )
-
-    raw = completion.choices[0].message.content or "{}"
     try:
-        result = PageContent.model_validate(json.loads(raw))
+        result = _extract_once(client, user_content)
+        # 正文充实却空结果 → 加严重试一次
+        if (
+            EXTRACT_RETRY_ON_EMPTY
+            and (not result.has_content or not result.knowledge)
+            and len(cleaned) >= 200
+        ):
+            print(colored("🔁 空抽取，加严重试本页…", "yellow"))
+            result = _extract_once(client, user_content, strict_retry=True)
     except (json.JSONDecodeError, ValidationError) as exc:
         print(colored(f"⚠️  解析失败，跳过：{exc}", "yellow"))
-        state = KnowledgeState(
-            knowledge=state.knowledge,
-            next_page=next_state_page,
-            skipped_blank=state.skipped_blank,
-            skipped_model=state.skipped_model,
-            skipped_parse=state.skipped_parse + [pdf_page],
-        )
-        save_knowledge_state(config, state)
-        return state
+        # 解析失败也重试一次
+        try:
+            print(colored("🔁 解析失败，重试本页…", "yellow"))
+            result = _extract_once(client, user_content, strict_retry=True)
+        except (json.JSONDecodeError, ValidationError) as exc2:
+            print(colored(f"⚠️  重试仍失败：{exc2}", "yellow"))
+            state = KnowledgeState(
+                knowledge=state.knowledge,
+                next_page=next_state_page,
+                skipped_blank=state.skipped_blank,
+                skipped_model=state.skipped_model,
+                skipped_parse=state.skipped_parse + [pdf_page],
+            )
+            save_knowledge_state(config, state)
+            return state
 
     if result.has_content and result.knowledge:
         new_items = [
             KnowledgeItem(page=pdf_page, text=t.strip())
             for t in result.knowledge
-            if t and t.strip()
+            if t and t.strip() and len(t.strip()) >= 12
         ]
-        # 过滤过短噪声
-        new_items = [i for i in new_items if len(i.text) >= 12]
         before = len(state.knowledge)
         knowledge = dedupe_knowledge(state.knowledge + new_items)
         added = len(knowledge) - before
@@ -609,11 +693,9 @@ def process_page(
 def chunk_items(
     items: list[KnowledgeItem], max_chars: int
 ) -> list[list[KnowledgeItem]]:
-    """按页序累计字符分块，尽量在页边界切开。"""
     if not items:
         return []
 
-    # 先按页聚合，再装桶，避免同一页被拆到两块
     by_page: dict[int, list[KnowledgeItem]] = {}
     for item in items:
         by_page.setdefault(item.page, []).append(item)
@@ -642,42 +724,63 @@ def chunk_page_range(chunk: list[KnowledgeItem]) -> str:
     return f"第 {min(pages)}–{max(pages)} 页"
 
 
-def _chat_summary(
+def _chat_pro(
     client: OpenAI,
     system: str,
     user: str,
     *,
-    use_thinking: bool,
+    reasoning_effort: str,
+    temperature: float = SUMMARY_TEMPERATURE,
+    max_tokens: int = SUMMARY_MAX_TOKENS,
 ) -> str:
-    kwargs: dict = {
-        "model": MODEL_SUMMARY,
-        "messages": [
+    completion = chat_create_with_retry(
+        client,
+        model=MODEL_SUMMARY,
+        messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        "temperature": SUMMARY_TEMPERATURE,
-        "max_tokens": SUMMARY_MAX_TOKENS,
-        "extra_body": (
-            EXTRA_BODY_THINKING if use_thinking else EXTRA_BODY_NO_THINKING
-        ),
-    }
-    if use_thinking:
-        # DeepSeek：thinking 模式下用 reasoning_effort 控制思考强度
-        kwargs["reasoning_effort"] = SUMMARY_REASONING_EFFORT
-
-    completion = chat_create_with_retry(client, **kwargs)
-    msg = completion.choices[0].message
-    content = msg.content or ""
+        temperature=temperature,
+        max_tokens=max_tokens,
+        reasoning_effort=reasoning_effort,
+        extra_body=EXTRA_BODY_THINKING,
+    )
+    content = completion.choices[0].message.content or ""
     if not content.strip():
-        # 极端情况：额度被 reasoning 占满
         print(
             colored(
-                "⚠️  总结 content 为空（可能 max_tokens 被 thinking 占满），"
-                "请重试或提高 SUMMARY_MAX_TOKENS。",
+                "⚠️  模型 content 为空（thinking 可能占满 max_tokens），重试一次…",
                 "yellow",
             )
         )
+        completion = chat_create_with_retry(
+            client,
+            model=MODEL_SUMMARY,
+            messages=[
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": user
+                    + "\n\n请直接给出完整最终答案正文，确保 content 非空。",
+                },
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            reasoning_effort="high",
+            extra_body=EXTRA_BODY_THINKING,
+        )
+        content = completion.choices[0].message.content or ""
     return content
+
+
+def format_toc_hint(toc: list[tuple[int, str, int]] | None) -> str:
+    if not toc:
+        return ""
+    lines = ["【PDF 书签目录】（分题可对齐；勿编造目录外章节）"]
+    for level, title, page in toc:
+        indent = "  " * max(0, level - 1)
+        lines.append(f"{indent}- {title}（第 {page} 页）")
+    return "\n".join(lines) + "\n\n"
 
 
 def generate_summary(
@@ -696,27 +799,16 @@ def generate_summary(
     total = len(knowledge)
     print(
         colored(
-            f"\n🤔 生成总结（Pro + thinking，{total} 条 / {len(chunks)} 块）…",
+            f"\n🤔 生成总结（Pro+thinking，{total} 条 / {len(chunks)} 块）…",
             "cyan",
         )
     )
 
-    toc_hint = ""
-    if toc:
-        # 精简目录树给终稿，帮助分题命名
-        lines = ["【PDF 书签目录】（分题标题可对齐，勿编造目录外章节）"]
-        for level, title, page in toc[:80]:
-            indent = "  " * max(0, level - 1)
-            lines.append(f"{indent}- {title}（第 {page} 页）")
-        if len(toc) > 80:
-            lines.append(f"- …共 {len(toc)} 条书签，已截断显示")
-        toc_hint = "\n".join(lines) + "\n\n"
-
+    toc_hint = format_toc_hint(toc)
     gold_hint = ""
     if gold_notes:
         gold_hint = (
-            "【人工金标准 / 修订笔记】（优先对齐其结构、术语与遗漏点；"
-            "事实仍以知识点页码为准，勿照抄过时错误）\n"
+            "【人工金标准】（对齐结构与强调；事实以知识点页码为准）\n"
             f"{gold_notes}\n\n"
         )
 
@@ -726,66 +818,104 @@ def generate_summary(
         user = (
             f"{toc_hint}{gold_hint}"
             f"全书知识点共 {total} 条，覆盖约 {pages}。\n"
-            f"请直接输出完整总结（含导读、分题详述、主题索引）。\n\n"
+            f"请输出完整总结（导读、分题详述、主题索引）。\n\n"
             + "\n".join(lines)
         )
-        # 终稿开 thinking
-        summary = _chat_summary(
-            client, FINAL_SUMMARY_PROMPT, user, use_thinking=True
+        draft = _chat_pro(
+            client,
+            FINAL_SUMMARY_PROMPT,
+            user,
+            reasoning_effort=SUMMARY_REASONING_EFFORT,
         )
     else:
         partials: list[str] = []
         for i, chunk in enumerate(chunks, 1):
             pr = chunk_page_range(chunk)
-            print(colored(f"   · 分块消化 {i}/{len(chunks)}（{pr}）…", "cyan"))
+            print(
+                colored(
+                    f"   · 分块消化 {i}/{len(chunks)}（{pr}，thinking）…",
+                    "cyan",
+                )
+            )
             lines = [x.as_line() for x in chunk]
             user = (
-                f"这是全书第 {i}/{len(chunks)} 批知识点，本批约 {pr}，"
-                f"共 {len(chunk)} 条。\n"
-                f"请只消化本批，勿假装覆盖全书。\n\n"
-                + "\n".join(lines)
+                f"全书第 {i}/{len(chunks)} 批，本批约 {pr}，共 {len(chunk)} 条。\n"
+                f"只消化本批。\n\n" + "\n".join(lines)
             )
-            # 中间稿可关 thinking 控成本；终稿再开
             partials.append(
-                _chat_summary(
+                _chat_pro(
                     client,
                     PARTIAL_SUMMARY_PROMPT,
                     user,
-                    use_thinking=False,
+                    reasoning_effort=PARTIAL_REASONING_EFFORT,
                 )
             )
 
-        print(colored("   · 合并为终稿（thinking）…", "cyan"))
+        print(colored("   · 合并终稿（thinking max）…", "cyan"))
         merged_parts = []
         for i, (chunk, partial) in enumerate(zip(chunks, partials), 1):
             pr = chunk_page_range(chunk)
             merged_parts.append(
-                f"### 中间稿 {i}/{len(chunks)}（原知识点约 {pr}）\n\n{partial}"
+                f"### 中间稿 {i}/{len(chunks)}（约 {pr}）\n\n{partial}"
             )
         all_pages = [i.page for i in knowledge if i.page > 0]
         span = (
-            f"{min(all_pages)}–{max(all_pages)}"
-            if all_pages
-            else "未知"
+            f"{min(all_pages)}–{max(all_pages)}" if all_pages else "未知"
         )
         user = (
             f"{toc_hint}{gold_hint}"
-            f"下面是 {len(partials)} 段按页序的中间稿，原始知识点共 {total} 条，"
-            f"页码跨度约 {span}。\n"
-            f"请合并为一篇**完整终稿**：导读 + 分题详述 + 主题索引；\n"
-            f"消除重复，统一术语，**前中后都要覆盖**，页码全部保留且勿编造。\n\n"
+            f"{len(partials)} 段中间稿；原始 {total} 条；页码跨度约 {span}。\n"
+            f"合并为完整终稿：导读 + 分题详述 + 主题索引；"
+            f"去重、统一术语、前中后覆盖、页码勿编造。\n\n"
             + "\n\n---\n\n".join(merged_parts)
         )
-        summary = _chat_summary(
-            client, FINAL_SUMMARY_PROMPT, user, use_thinking=True
+        draft = _chat_pro(
+            client,
+            FINAL_SUMMARY_PROMPT,
+            user,
+            reasoning_effort=SUMMARY_REASONING_EFFORT,
         )
+
+    # 第二轮审校（质量优先）
+    print(colored("   · 编辑审校（thinking max）…", "cyan"))
+    # 审校时附带压缩知识点清单（按页抽样+全量若不太长）
+    kb_lines = [i.as_line() for i in knowledge]
+    kb_blob = "\n".join(kb_lines)
+    if len(kb_blob) > 100_000:
+        # 过长则按页取每页前 2 条 + 全部页码列表
+        by_page: dict[int, list[str]] = {}
+        for item in knowledge:
+            by_page.setdefault(item.page, []).append(item.text)
+        sample = []
+        for p in sorted(by_page):
+            for t in by_page[p][:2]:
+                sample.append(f"[第 {p} 页] {t}")
+        kb_blob = (
+            "（知识点过长，以下为每页最多 2 条抽样；页码集合："
+            f"{sorted(by_page.keys())}）\n" + "\n".join(sample)
+        )
+
+    review_user = (
+        f"{toc_hint}{gold_hint}"
+        f"## 初稿\n\n{draft}\n\n"
+        f"## 原始知识点\n\n{kb_blob}\n"
+    )
+    summary = _chat_pro(
+        client,
+        REVIEW_SYSTEM_PROMPT,
+        review_user,
+        reasoning_effort=REVIEW_REASONING_EFFORT,
+    )
+    if not summary.strip():
+        print(colored("⚠️  审校输出为空，回退使用初稿", "yellow"))
+        summary = draft
 
     cites = len(re.findall(r"第\s*\d+\s*页", summary or ""))
     print(colored(f"✨ 总结完成（页码类引用约 {cites} 处）", "green"))
-    if cites < max(10, total // 30):
+    if cites < max(12, total // 25):
         print(
             colored(
-                "⚠️  页码引用仍偏少；可删 md 后重跑总结，或检查知识点是否过稀。",
+                "⚠️  页码引用仍可能偏少；可删 md 后重跑或补充 gold。",
                 "yellow",
             )
         )
@@ -841,22 +971,39 @@ def save_summary(
     content = f"""# 书籍分析：{config.pdf_name}
 
 - 生成时间：{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-- 抽取模型：{MODEL_EXTRACT}
-- 总结模型：{MODEL_SUMMARY}
+- 抽取模型：{MODEL_EXTRACT}（thinking）
+- 总结模型：{MODEL_SUMMARY}（thinking + 审校）
 - 覆盖 PDF 页码：{page_range}
 - 知识点条数：{len(state.knowledge)}
 - 页码类引用（约）：{cite_n} 处
 {format_skip_meta(state)}
 - 说明：页码为 PDF 阅读器页码（从 1 起）。重写总结请先删除本文件再运行。
+- 可选金标准：同目录 `{config.gold_path.name}`
 
 {summary.strip()}
 
 ---
-*由 PDF 书籍分析器（DeepSeek）生成*
+*由 PDF 书籍分析器（DeepSeek · 质量优先）生成*
 """
     print(colored(f"\n📝 写入总结：{config.summary_path}", "cyan"))
-    with open(config.summary_path, "w", encoding="utf-8") as f:
-        f.write(content)
+    # 原子写 md
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=config.summary_path.stem + ".",
+        suffix=".tmp",
+        dir=str(config.summary_path.parent),
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, config.summary_path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
     print(colored("✅ 已保存", "green"))
 
 
@@ -869,11 +1016,11 @@ def main(argv: list[str] | None = None) -> None:
     print(
         colored(
             f"""
-📚 PDF 书籍分析器
-----------------
+📚 PDF 书籍分析器（质量优先）
+----------------------------
 PDF：    {config.pdf_source}
-抽取：   {MODEL_EXTRACT}
-总结：   {MODEL_SUMMARY}
+抽取：   {MODEL_EXTRACT} + thinking
+总结：   {MODEL_SUMMARY} + thinking + 审校
 进度：   {config.knowledge_path}
 总结：   {config.summary_path}
 金标准： {config.gold_path}（可选）
@@ -895,19 +1042,18 @@ PDF：    {config.pdf_source}
     if toc:
         print(colored(f"📑 读到 PDF 书签 {len(toc)} 条", "cyan"))
     else:
-        print(colored("📑 无 PDF 书签（章节定位较弱）", "yellow"))
+        print(colored("📑 无 PDF 书签（依赖邻页/下页上下文）", "yellow"))
 
     extract_done = pages_complete(state, total_pages)
     summary_exists = config.summary_path.exists()
 
-    # 抽页完整 + 总结已有 → 跳过（不调 API）
     if extract_done and summary_exists:
         print(
             colored(
                 f"\n✅ 已完成（抽取 {state.next_page}/{total_pages}，总结已存在）\n"
                 f"   总结：{config.summary_path}\n"
                 f"   重写总结 → 删除该 md 后再执行\n"
-                f"   人工润色 → 可另存为 {config.gold_path.name} 供下次总结参考\n"
+                f"   人工润色 → 另存为 {config.gold_path.name} 供下次总结参考\n"
                 f"   重抽全书 → 删除 knowledge JSON 后再执行",
                 "green",
             )
@@ -924,7 +1070,7 @@ PDF：    {config.pdf_source}
             print(
                 colored(
                     f"\n📚 共 {total_pages} 页，"
-                    f"处理第 {start + 1}–{total_pages} 页（Flash）…",
+                    f"处理第 {start + 1}–{total_pages} 页（Pro+thinking）…",
                     "cyan",
                 )
             )
@@ -938,12 +1084,13 @@ PDF：    {config.pdf_source}
                     page_num,
                     total_pages,
                     toc,
+                    pdf_document,
                 )
         else:
             print(
                 colored(
                     f"\n✅ 抽取已完成（{state.next_page}/{total_pages}），"
-                    f"仅生成总结（Pro + thinking）…",
+                    f"仅生成总结…",
                     "green",
                 )
             )
