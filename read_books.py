@@ -3,17 +3,16 @@ PDF 书籍分析器 — 逐页提取知识点，生成一篇带页码的总结�
 
 用法：
   python read_books.py book.pdf
+  python read_books.py book.pdf --profile auto|economy|balanced|quality
 
-质量优先策略（不计成本）：
-  - 逐页抽取与全书总结均用 deepseek-v4-pro
-  - 抽取 / 分块消化 / 终稿 / 审校 均开启 thinking
-  - 书签定位 + 邻页要点 + 下页预览 增强连贯
-  - 终稿后再做一轮编辑审校
-  - 产出：book_analysis/<书名>.pdf | _knowledge.json | .md
-  - 可选金标准：book_analysis/<书名>_gold.md
-  - 抽页完成且总结已存在 → 跳过；重写总结请先删 .md
+  auto     — 预读评估后动态选 Flash/Pro、high/max（默认）
+  economy  — 固定省钱：全 Flash，无审校
+  balanced — 固定平衡：Flash 抽 + Pro 结/审 high
+  quality  — 固定最强：Pro 抽+thinking；结/审 max
 
-API Key 仅从环境变量 DEEPSEEK_API_KEY 读取。
+未传 --profile 时可读环境变量 READ_BOOKS_PROFILE。
+产出：book_analysis/<书名>.pdf | _knowledge.json | .md
+Ctrl+C 可中断并保留进度。API Key：DEEPSEEK_API_KEY。
 """
 
 from __future__ import annotations
@@ -43,32 +42,475 @@ from pydantic import BaseModel, ValidationError
 from termcolor import colored
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-# 质量优先：全程 Pro
-MODEL_EXTRACT = "deepseek-v4-pro"
-MODEL_SUMMARY = "deepseek-v4-pro"
+MODEL_FLASH = "deepseek-v4-flash"
+MODEL_PRO = "deepseek-v4-pro"
 
 MIN_PAGE_CHARS = 40
-# Pro 长上下文：尽量少分块，整书一次吃进更好
-SUMMARY_CHUNK_CHARS = 120_000
-MAX_PAGE_TEXT_CHARS = 40_000
-NEIGHBOR_CONTEXT_ITEMS = 12  # 上页要点条数
-LOOKAHEAD_CHARS = 1_200  # 下页正文预览
+MAX_PAGE_TEXT_CHARS = 24_000
+NEIGHBOR_CONTEXT_ITEMS = 10
+LOOKAHEAD_CHARS = 1_000
 API_MAX_RETRIES = 6
 API_RETRY_BASE_SECONDS = 2.0
-EXTRACT_TEMPERATURE = 0.1
+EXTRACT_TEMPERATURE = 0.15
 SUMMARY_TEMPERATURE = 0.2
-EXTRACT_MAX_TOKENS = 8_192
+EXTRACT_MAX_TOKENS = 4_096
 SUMMARY_MAX_TOKENS = 32_768
-EXTRACT_REASONING_EFFORT = "high"
-SUMMARY_REASONING_EFFORT = "max"
-PARTIAL_REASONING_EFFORT = "high"
-REVIEW_REASONING_EFFORT = "max"
-GOLD_MAX_CHARS = 60_000
-EXTRACT_RETRY_ON_EMPTY = True  # 正文充实却抽到 0 条时再试一次
+GOLD_MAX_CHARS = 40_000
+EXTRACT_RETRY_ON_EMPTY = True
+# 审校后页码引用过稀时，可自动加一轮 max 审校
+CITE_ESCALATE_MIN = 12
+# auto 预读：采样页数（实质性正文页）
+PREFLIGHT_SAMPLE_TARGET = 5
+PREFLIGHT_CHARS_PER_PAGE = 2_500
 
+EXTRA_BODY_NO_THINKING = {"thinking": {"type": "disabled"}}
 EXTRA_BODY_THINKING = {"thinking": {"type": "enabled"}}
 
 BASE_DIR = Path("book_analysis")
+PROFILE_ENV = "READ_BOOKS_PROFILE"
+VALID_PROFILES = ("auto", "economy", "balanced", "quality")
+
+
+@dataclass(frozen=True)
+class PipelineStrategy:
+    """流水线策略：档位 / 预读评估 + 运行时微调。"""
+
+    name: str
+    extract_model: str
+    summary_model: str
+    extract_thinking: bool
+    extract_effort: str  # 仅 extract_thinking 时有意义
+    partial_effort: str
+    final_effort: str
+    review_effort: str
+    do_review: bool
+    auto_escalate_review: bool  # 页码稀 → 再 max 审一轮
+    summary_chunk_chars: int
+    description: str
+
+    def label(self) -> str:
+        ext_t = "+thinking" if self.extract_thinking else ""
+        rev = f"审校:{self.review_effort}" if self.do_review else "无审校"
+        return (
+            f"{self.name} | 抽:{self.extract_model}{ext_t} | "
+            f"结:{self.summary_model}({self.final_effort}) | {rev}"
+        )
+
+    def with_updates(self, **kwargs) -> PipelineStrategy:
+        data = {
+            "name": self.name,
+            "extract_model": self.extract_model,
+            "summary_model": self.summary_model,
+            "extract_thinking": self.extract_thinking,
+            "extract_effort": self.extract_effort,
+            "partial_effort": self.partial_effort,
+            "final_effort": self.final_effort,
+            "review_effort": self.review_effort,
+            "do_review": self.do_review,
+            "auto_escalate_review": self.auto_escalate_review,
+            "summary_chunk_chars": self.summary_chunk_chars,
+            "description": self.description,
+        }
+        data.update(kwargs)
+        return PipelineStrategy(**data)
+
+
+class PreflightAssessment(BaseModel):
+    """预读评估结果（由 Flash 给出，再映射为策略）。"""
+
+    difficulty: int  # 1–5
+    text_noise: int  # 1–5 排版/OCR/译文噪声
+    term_density: int  # 1–5 术语密度
+    structure_complexity: int  # 1–5 论证/结构复杂度
+    need_pro_extract: bool
+    need_extract_thinking: bool
+    summary_effort: str  # high | max
+    review_effort: str  # high | max
+    do_review: bool
+    rationale: str  # 简短中文理由
+
+
+PREFLIGHT_SYSTEM = """你是文档难度评估器。根据抽样页正文，判断后续流水线该用多强的模型。
+
+只返回 JSON（字段必须齐全）：
+{
+  "difficulty": 1到5的整数,
+  "text_noise": 1到5,
+  "term_density": 1到5,
+  "structure_complexity": 1到5,
+  "need_pro_extract": true/false,
+  "need_extract_thinking": true/false,
+  "summary_effort": "high" 或 "max",
+  "review_effort": "high" 或 "max",
+  "do_review": true/false,
+  "rationale": "一两句中文理由"
+}
+
+判断参考：
+- difficulty 1–2：教材式清晰、术语少 → 抽页 Flash 即可；总结 high；审校可关或 high
+- difficulty 3：一般学术/技术书 → 抽 Flash；总结 Pro high；要审校
+- difficulty 4：高密度术语、译著别扭、跨页论证多 → 可考虑 Pro 抽页；总结 max；要审校
+- difficulty 5：极难/高噪声/强形式化 → Pro 抽+thinking；总结与审校 max
+- need_pro_extract：仅当 Flash 明显可能漏定义/搞砸术语时为 true
+- need_extract_thinking：仅当极难且值得为每页多花钱时为 true（通常 false）
+- text_noise 高不等于一定要 Pro 抽，但应提高 summary/review effort
+- 不要因为「看起来重要」就一律 max；按样本难度诚实评估
+"""
+
+
+def _base_profiles() -> dict[str, PipelineStrategy]:
+    return {
+        "economy": PipelineStrategy(
+            name="economy",
+            extract_model=MODEL_FLASH,
+            summary_model=MODEL_FLASH,
+            extract_thinking=False,
+            extract_effort="high",
+            partial_effort="high",
+            final_effort="high",
+            review_effort="high",
+            do_review=False,
+            auto_escalate_review=False,
+            summary_chunk_chars=80_000,
+            description="省钱：全 Flash，无审校",
+        ),
+        "balanced": PipelineStrategy(
+            name="balanced",
+            extract_model=MODEL_FLASH,
+            summary_model=MODEL_PRO,
+            extract_thinking=False,
+            extract_effort="high",
+            partial_effort="high",
+            final_effort="high",
+            review_effort="high",
+            do_review=True,
+            auto_escalate_review=True,
+            summary_chunk_chars=100_000,
+            description="固定平衡：Flash 抽 + Pro 结/审 high",
+        ),
+        "quality": PipelineStrategy(
+            name="quality",
+            extract_model=MODEL_PRO,
+            summary_model=MODEL_PRO,
+            extract_thinking=True,
+            extract_effort="high",
+            partial_effort="high",
+            final_effort="max",
+            review_effort="max",
+            do_review=True,
+            auto_escalate_review=True,
+            summary_chunk_chars=140_000,
+            description="固定最强：Pro 抽+thinking；结/审 max",
+        ),
+        # auto 占位；真正参数由预读评估填充
+        "auto": PipelineStrategy(
+            name="auto",
+            extract_model=MODEL_FLASH,
+            summary_model=MODEL_PRO,
+            extract_thinking=False,
+            extract_effort="high",
+            partial_effort="high",
+            final_effort="high",
+            review_effort="high",
+            do_review=True,
+            auto_escalate_review=True,
+            summary_chunk_chars=100_000,
+            description="预读评估后动态决定 Flash/Pro 与 high/max",
+        ),
+    }
+
+
+def _tune_chunk_size(
+    base_chunk: int,
+    *,
+    total_pages: int | None,
+    knowledge_chars: int | None,
+) -> int:
+    chunk = base_chunk
+    if total_pages is not None:
+        if total_pages <= 40:
+            chunk = max(chunk, 150_000)
+        elif total_pages >= 250:
+            chunk = min(chunk, 70_000)
+    if knowledge_chars is not None:
+        if knowledge_chars < 40_000:
+            chunk = max(chunk, knowledge_chars + 10_000)
+        elif knowledge_chars > 200_000:
+            chunk = min(chunk, 90_000)
+    return chunk
+
+
+def strategy_from_assessment(
+    assessment: PreflightAssessment,
+    *,
+    total_pages: int | None = None,
+) -> PipelineStrategy:
+    """把预读评分映射为流水线参数。"""
+    # 总结侧：至少 Pro（auto 档不为省钱而降到 Flash 总结，除非 difficulty=1）
+    if assessment.difficulty <= 1 and assessment.text_noise <= 2:
+        summary_model = MODEL_FLASH
+        do_review = False
+        auto_esc = False
+    else:
+        summary_model = MODEL_PRO
+        do_review = assessment.do_review if assessment.difficulty >= 2 else False
+        auto_esc = assessment.difficulty >= 3
+
+    extract_model = (
+        MODEL_PRO if assessment.need_pro_extract or assessment.difficulty >= 4 else MODEL_FLASH
+    )
+    extract_thinking = bool(
+        assessment.need_extract_thinking and extract_model == MODEL_PRO
+    )
+
+    final_effort = assessment.summary_effort if assessment.summary_effort in (
+        "high",
+        "max",
+    ) else "high"
+    review_effort = assessment.review_effort if assessment.review_effort in (
+        "high",
+        "max",
+    ) else "high"
+    if assessment.difficulty >= 5:
+        final_effort = "max"
+        review_effort = "max"
+        do_review = True
+        auto_esc = True
+
+    # 与模型建议对齐：难书强制审校
+    if assessment.difficulty >= 3:
+        do_review = True
+
+    chunk = 100_000
+    if assessment.structure_complexity >= 4:
+        chunk = 90_000  # 略小块，消化更细
+    if total_pages and total_pages <= 40:
+        chunk = max(chunk, 140_000)
+
+    chunk = _tune_chunk_size(chunk, total_pages=total_pages, knowledge_chars=None)
+
+    rationale = (assessment.rationale or "").strip()
+    desc = (
+        f"预读评估 difficulty={assessment.difficulty} "
+        f"noise={assessment.text_noise} terms={assessment.term_density} "
+        f"struct={assessment.structure_complexity}"
+    )
+    if rationale:
+        desc += f"；{rationale}"
+
+    return PipelineStrategy(
+        name="auto",
+        extract_model=extract_model,
+        summary_model=summary_model,
+        extract_thinking=extract_thinking,
+        extract_effort="high",
+        partial_effort="high",
+        final_effort=final_effort,
+        review_effort=review_effort,
+        do_review=do_review,
+        auto_escalate_review=auto_esc,
+        summary_chunk_chars=chunk,
+        description=desc,
+    )
+
+
+def resolve_strategy(
+    profile_name: str | None = None,
+    *,
+    total_pages: int | None = None,
+    knowledge_chars: int | None = None,
+    prebuilt: PipelineStrategy | None = None,
+) -> PipelineStrategy:
+    """
+    解析策略：
+    - 固定档 economy/balanced/quality
+    - auto 须先预读得到 prebuilt，否则暂回 balanced 骨架再评估
+    - 再按页数/知识量微调分块
+    """
+    profiles = _base_profiles()
+    raw = (profile_name or os.environ.get(PROFILE_ENV) or "auto").strip().lower()
+    if raw not in VALID_PROFILES:
+        print(
+            colored(
+                f"⚠️  未知 {PROFILE_ENV}={raw!r}，回退 auto。"
+                f"可选：{', '.join(VALID_PROFILES)}",
+                "yellow",
+            ),
+            file=sys.stderr,
+        )
+        raw = "auto"
+
+    if prebuilt is not None and raw == "auto":
+        base = prebuilt
+    elif raw == "auto":
+        base = profiles["balanced"].with_updates(
+            name="auto",
+            description="auto（待预读评估）",
+        )
+    else:
+        base = profiles[raw]
+
+    chunk = _tune_chunk_size(
+        base.summary_chunk_chars,
+        total_pages=total_pages,
+        knowledge_chars=knowledge_chars,
+    )
+    if chunk != base.summary_chunk_chars:
+        return base.with_updates(
+            summary_chunk_chars=chunk,
+            description=base.description + f"；分块≈{chunk // 1000}k字(自动)",
+        )
+    return base
+
+
+def pick_preflight_pages(total_pages: int, target: int = PREFLIGHT_SAMPLE_TARGET) -> list[int]:
+    """选 0-based 页码：靠前、中间、靠后各取，避免只读封面。"""
+    if total_pages <= 0:
+        return []
+    if total_pages <= target:
+        return list(range(total_pages))
+
+    # 相对位置：跳过可能的封面，取 5%、20%、40%、65%、85%
+    fracs = [0.05, 0.2, 0.4, 0.65, 0.85]
+    pages = sorted({min(total_pages - 1, max(0, int(total_pages * f))) for f in fracs})
+    # 不足则补均匀页
+    i = 0
+    while len(pages) < target and i < total_pages:
+        if i not in pages:
+            pages.append(i)
+        i += 1
+        pages = sorted(set(pages))
+    return pages[:target]
+
+
+def collect_preflight_samples(
+    pdf_document: pymupdf.Document,
+    page_indices: list[int],
+) -> list[tuple[int, str]]:
+    """收集有实质文字的抽样页 (1-based_page, text)。"""
+    samples: list[tuple[int, str]] = []
+    tried = list(page_indices)
+    # 若抽样偏空，向后扫一些页补足
+    extra = 0
+    idx = 0
+    total = pdf_document.page_count
+    while len(samples) < PREFLIGHT_SAMPLE_TARGET and (
+        idx < len(tried) or extra < total
+    ):
+        if idx < len(tried):
+            p0 = tried[idx]
+            idx += 1
+        else:
+            p0 = extra
+            extra += 1
+            if p0 in tried:
+                continue
+        text = clean_page_text(pdf_document[p0].get_text())
+        if len(text) < MIN_PAGE_CHARS:
+            continue
+        samples.append((p0 + 1, text[:PREFLIGHT_CHARS_PER_PAGE]))
+    return samples
+
+
+def run_preflight_assessment(
+    client: OpenAI,
+    samples: list[tuple[int, str]],
+    *,
+    total_pages: int,
+    has_toc: bool,
+) -> PreflightAssessment:
+    """用 Flash 预读评估，决定 Flash/Pro 与 high/max。"""
+    if not samples:
+        # 无样本：保守 balanced
+        return PreflightAssessment(
+            difficulty=3,
+            text_noise=3,
+            term_density=3,
+            structure_complexity=3,
+            need_pro_extract=False,
+            need_extract_thinking=False,
+            summary_effort="high",
+            review_effort="high",
+            do_review=True,
+            rationale="抽样无正文，回退中等难度假设",
+        )
+
+    blocks = []
+    for page, text in samples:
+        blocks.append(f"### 第 {page} 页样本\n{text}")
+    user = (
+        f"全书约 {total_pages} 页；PDF 书签：{'有' if has_toc else '无'}。\n"
+        f"以下为 {len(samples)} 个抽样页（可能截断）。请评估难度并给出流水线建议。\n\n"
+        + "\n\n".join(blocks)
+    )
+
+    print(
+        colored(
+            f"🔍 预读评估：{len(samples)} 页样本 → 决定 Flash/Pro 与 high/max …",
+            "cyan",
+        )
+    )
+    completion = chat_create_with_retry(
+        client,
+        model=MODEL_FLASH,
+        messages=[
+            {"role": "system", "content": PREFLIGHT_SYSTEM},
+            {"role": "user", "content": user},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.1,
+        max_tokens=1_024,
+        extra_body=EXTRA_BODY_NO_THINKING,
+    )
+    raw = completion.choices[0].message.content or "{}"
+    try:
+        data = json.loads(raw)
+        # 规范化 effort 字段
+        for key in ("summary_effort", "review_effort"):
+            if str(data.get(key, "")).lower() not in ("high", "max"):
+                data[key] = "high"
+        for key in (
+            "difficulty",
+            "text_noise",
+            "term_density",
+            "structure_complexity",
+        ):
+            try:
+                data[key] = max(1, min(5, int(data.get(key, 3))))
+            except (TypeError, ValueError):
+                data[key] = 3
+        assessment = PreflightAssessment.model_validate(data)
+    except (json.JSONDecodeError, ValidationError) as exc:
+        print(colored(f"⚠️  预读评估解析失败（{exc}），回退 balanced 参数", "yellow"))
+        assessment = PreflightAssessment(
+            difficulty=3,
+            text_noise=3,
+            term_density=3,
+            structure_complexity=3,
+            need_pro_extract=False,
+            need_extract_thinking=False,
+            summary_effort="high",
+            review_effort="high",
+            do_review=True,
+            rationale="评估解析失败，回退中等配置",
+        )
+
+    print(
+        colored(
+            f"   · difficulty={assessment.difficulty} "
+            f"noise={assessment.text_noise} "
+            f"terms={assessment.term_density} "
+            f"struct={assessment.structure_complexity}\n"
+            f"   · 抽页Pro={assessment.need_pro_extract} "
+            f"抽thinking={assessment.need_extract_thinking} "
+            f"总结={assessment.summary_effort} "
+            f"审校={assessment.review_effort} "
+            f"做审校={assessment.do_review}\n"
+            f"   · 理由：{assessment.rationale}",
+            "cyan",
+        )
+    )
+    return assessment
 
 API_KEY_SETUP_HELP = """
 请在系统环境中设置 DEEPSEEK_API_KEY，不要把 Key 写进项目。
@@ -95,6 +537,7 @@ class Config:
     knowledge_path: Path
     summary_path: Path
     gold_path: Path
+    profile_name: str
 
 
 @dataclass
@@ -234,16 +677,47 @@ def parse_args(argv: list[str] | None = None) -> Config:
     parser = argparse.ArgumentParser(
         prog="read_books.py",
         description=(
-            "质量优先：Pro 逐页抽取 + Pro 总结（thinking）。"
-            "只需指定 PDF；产出在 book_analysis/。"
+            "逐页抽取 + 总结/审校。参数：PDF，以及可选固定策略档。"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "策略说明：\n"
+            "  auto      预读若干页后评估，动态选 Flash/Pro 与 high/max（默认）\n"
+            "  economy   固定省钱：全 Flash，无审校\n"
+            "  balanced  固定平衡：Flash 抽 + Pro 结/审 high\n"
+            "  quality   固定最强：Pro 抽+thinking；结/审 max\n"
+            f"未指定 --profile 时可读环境变量 {PROFILE_ENV}。\n"
         ),
     )
     parser.add_argument("pdf", help="PDF 路径或文件名")
+    parser.add_argument(
+        "--profile",
+        "-p",
+        choices=VALID_PROFILES,
+        default=None,
+        help="流水线策略档（默认 auto；也可用环境变量 "
+        f"{PROFILE_ENV}）",
+    )
     args = parser.parse_args(argv)
 
     source = Path(args.pdf)
     if source.suffix.lower() != ".pdf":
         parser.error("文件必须是 .pdf")
+
+    # 优先级：--profile > 环境变量 > auto
+    if args.profile:
+        profile = args.profile
+    else:
+        profile = (os.environ.get(PROFILE_ENV) or "auto").strip().lower()
+        if profile not in VALID_PROFILES:
+            print(
+                colored(
+                    f"⚠️  环境变量 {PROFILE_ENV}={profile!r} 无效，回退 auto",
+                    "yellow",
+                ),
+                file=sys.stderr,
+            )
+            profile = "auto"
 
     pdf_name = source.name
     stem = source.stem
@@ -254,6 +728,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         knowledge_path=BASE_DIR / f"{stem}_knowledge.json",
         summary_path=BASE_DIR / f"{stem}.md",
         gold_path=BASE_DIR / f"{stem}_gold.md",
+        profile_name=profile,
     )
 
 
@@ -359,7 +834,11 @@ def atomic_write_json(path: Path, payload: dict) -> None:
         raise
 
 
-def save_knowledge_state(config: Config, state: KnowledgeState) -> None:
+def save_knowledge_state(
+    config: Config,
+    state: KnowledgeState,
+    strategy: PipelineStrategy | None = None,
+) -> None:
     print(
         colored(
             f"💾 保存进度（{len(state.knowledge)} 条，"
@@ -367,6 +846,18 @@ def save_knowledge_state(config: Config, state: KnowledgeState) -> None:
             "blue",
         )
     )
+    meta = {
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+        "profile": config.profile_name,
+    }
+    if strategy is not None:
+        meta.update(
+            {
+                "model_extract": strategy.extract_model,
+                "model_summary": strategy.summary_model,
+                "strategy": strategy.label(),
+            }
+        )
     payload = {
         "knowledge": [item.to_dict() for item in state.knowledge],
         "next_page": state.next_page,
@@ -375,11 +866,7 @@ def save_knowledge_state(config: Config, state: KnowledgeState) -> None:
             "no_content": _unique_sorted_pages(state.skipped_model),
             "parse_error": _unique_sorted_pages(state.skipped_parse),
         },
-        "meta": {
-            "model_extract": MODEL_EXTRACT,
-            "model_summary": MODEL_SUMMARY,
-            "updated_at": datetime.now().isoformat(timespec="seconds"),
-        },
+        "meta": meta,
     }
     atomic_write_json(config.knowledge_path, payload)
 
@@ -566,6 +1053,7 @@ def load_gold_notes(gold_path: Path) -> str:
 def _extract_once(
     client: OpenAI,
     user_content: str,
+    strategy: PipelineStrategy,
     *,
     strict_retry: bool = False,
 ) -> PageContent:
@@ -576,19 +1064,25 @@ def _extract_once(
             "请更仔细扫描定义、命题与例子；仅当确为目录/索引/空白才 has_content=false。"
         )
 
-    completion = chat_create_with_retry(
-        client,
-        model=MODEL_EXTRACT,
-        messages=[
+    kwargs: dict = {
+        "model": strategy.extract_model,
+        "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user_content},
         ],
-        response_format={"type": "json_object"},
-        temperature=EXTRACT_TEMPERATURE,
-        max_tokens=EXTRACT_MAX_TOKENS,
-        reasoning_effort=EXTRACT_REASONING_EFFORT,
-        extra_body=EXTRA_BODY_THINKING,
-    )
+        "response_format": {"type": "json_object"},
+        "temperature": EXTRACT_TEMPERATURE,
+        "max_tokens": EXTRACT_MAX_TOKENS,
+        "extra_body": (
+            EXTRA_BODY_THINKING
+            if strategy.extract_thinking
+            else EXTRA_BODY_NO_THINKING
+        ),
+    }
+    if strategy.extract_thinking:
+        kwargs["reasoning_effort"] = strategy.extract_effort
+
+    completion = chat_create_with_retry(client, **kwargs)
     raw = completion.choices[0].message.content or "{}"
     return PageContent.model_validate(json.loads(raw))
 
@@ -602,6 +1096,7 @@ def process_page(
     total_pages: int,
     toc: list[tuple[int, str, int]],
     pdf_document: pymupdf.Document,
+    strategy: PipelineStrategy,
 ) -> KnowledgeState:
     pdf_page = page_num + 1
     next_state_page = page_num + 1
@@ -617,7 +1112,7 @@ def process_page(
             skipped_model=state.skipped_model,
             skipped_parse=state.skipped_parse,
         )
-        save_knowledge_state(config, state)
+        save_knowledge_state(config, state, strategy)
         return state
 
     ctx_parts = [f"全书共 {total_pages} 页；当前为第 {pdf_page} 页。"]
@@ -634,21 +1129,23 @@ def process_page(
     user_content = "\n\n".join(ctx_parts)
 
     try:
-        result = _extract_once(client, user_content)
-        # 正文充实却空结果 → 加严重试一次
+        result = _extract_once(client, user_content, strategy)
         if (
             EXTRACT_RETRY_ON_EMPTY
             and (not result.has_content or not result.knowledge)
             and len(cleaned) >= 200
         ):
             print(colored("🔁 空抽取，加严重试本页…", "yellow"))
-            result = _extract_once(client, user_content, strict_retry=True)
+            result = _extract_once(
+                client, user_content, strategy, strict_retry=True
+            )
     except (json.JSONDecodeError, ValidationError) as exc:
         print(colored(f"⚠️  解析失败，跳过：{exc}", "yellow"))
-        # 解析失败也重试一次
         try:
             print(colored("🔁 解析失败，重试本页…", "yellow"))
-            result = _extract_once(client, user_content, strict_retry=True)
+            result = _extract_once(
+                client, user_content, strategy, strict_retry=True
+            )
         except (json.JSONDecodeError, ValidationError) as exc2:
             print(colored(f"⚠️  重试仍失败：{exc2}", "yellow"))
             state = KnowledgeState(
@@ -658,7 +1155,7 @@ def process_page(
                 skipped_model=state.skipped_model,
                 skipped_parse=state.skipped_parse + [pdf_page],
             )
-            save_knowledge_state(config, state)
+            save_knowledge_state(config, state, strategy)
             return state
 
     if result.has_content and result.knowledge:
@@ -686,7 +1183,7 @@ def process_page(
         skipped_model=skipped_model,
         skipped_parse=state.skipped_parse,
     )
-    save_knowledge_state(config, state)
+    save_knowledge_state(config, state, strategy)
     return state
 
 
@@ -724,8 +1221,9 @@ def chunk_page_range(chunk: list[KnowledgeItem]) -> str:
     return f"第 {min(pages)}–{max(pages)} 页"
 
 
-def _chat_pro(
+def _chat_summary_model(
     client: OpenAI,
+    strategy: PipelineStrategy,
     system: str,
     user: str,
     *,
@@ -735,7 +1233,7 @@ def _chat_pro(
 ) -> str:
     completion = chat_create_with_retry(
         client,
-        model=MODEL_SUMMARY,
+        model=strategy.summary_model,
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -755,7 +1253,7 @@ def _chat_pro(
         )
         completion = chat_create_with_retry(
             client,
-            model=MODEL_SUMMARY,
+            model=strategy.summary_model,
             messages=[
                 {"role": "system", "content": system},
                 {
@@ -786,6 +1284,7 @@ def format_toc_hint(toc: list[tuple[int, str, int]] | None) -> str:
 def generate_summary(
     client: OpenAI,
     knowledge: list[KnowledgeItem],
+    strategy: PipelineStrategy,
     *,
     gold_notes: str = "",
     toc: list[tuple[int, str, int]] | None = None,
@@ -795,11 +1294,26 @@ def generate_summary(
         return ""
 
     knowledge = dedupe_knowledge(knowledge)
-    chunks = chunk_items(knowledge, SUMMARY_CHUNK_CHARS)
+    kb_chars = sum(len(i.text) for i in knowledge)
+    # 按知识体量再微调分块（保留预读得到的模型/effort）
+    tuned_chunk = _tune_chunk_size(
+        strategy.summary_chunk_chars,
+        total_pages=None,
+        knowledge_chars=kb_chars,
+    )
+    if tuned_chunk != strategy.summary_chunk_chars:
+        strategy = strategy.with_updates(
+            summary_chunk_chars=tuned_chunk,
+            description=strategy.description
+            + f"；分块≈{tuned_chunk // 1000}k字(知识量)",
+        )
+    chunks = chunk_items(knowledge, strategy.summary_chunk_chars)
     total = len(knowledge)
     print(
         colored(
-            f"\n🤔 生成总结（Pro+thinking，{total} 条 / {len(chunks)} 块）…",
+            f"\n🤔 生成总结（{strategy.summary_model}，"
+            f"effort={strategy.final_effort}，"
+            f"{total} 条 / {len(chunks)} 块，分块≈{strategy.summary_chunk_chars // 1000}k）…",
             "cyan",
         )
     )
@@ -821,11 +1335,12 @@ def generate_summary(
             f"请输出完整总结（导读、分题详述、主题索引）。\n\n"
             + "\n".join(lines)
         )
-        draft = _chat_pro(
+        draft = _chat_summary_model(
             client,
+            strategy,
             FINAL_SUMMARY_PROMPT,
             user,
-            reasoning_effort=SUMMARY_REASONING_EFFORT,
+            reasoning_effort=strategy.final_effort,
         )
     else:
         partials: list[str] = []
@@ -833,7 +1348,7 @@ def generate_summary(
             pr = chunk_page_range(chunk)
             print(
                 colored(
-                    f"   · 分块消化 {i}/{len(chunks)}（{pr}，thinking）…",
+                    f"   · 分块消化 {i}/{len(chunks)}（{pr}）…",
                     "cyan",
                 )
             )
@@ -843,15 +1358,21 @@ def generate_summary(
                 f"只消化本批。\n\n" + "\n".join(lines)
             )
             partials.append(
-                _chat_pro(
+                _chat_summary_model(
                     client,
+                    strategy,
                     PARTIAL_SUMMARY_PROMPT,
                     user,
-                    reasoning_effort=PARTIAL_REASONING_EFFORT,
+                    reasoning_effort=strategy.partial_effort,
                 )
             )
 
-        print(colored("   · 合并终稿（thinking max）…", "cyan"))
+        print(
+            colored(
+                f"   · 合并终稿（{strategy.final_effort}）…",
+                "cyan",
+            )
+        )
         merged_parts = []
         for i, (chunk, partial) in enumerate(zip(chunks, partials), 1):
             pr = chunk_page_range(chunk)
@@ -869,53 +1390,86 @@ def generate_summary(
             f"去重、统一术语、前中后覆盖、页码勿编造。\n\n"
             + "\n\n---\n\n".join(merged_parts)
         )
-        draft = _chat_pro(
+        draft = _chat_summary_model(
             client,
+            strategy,
             FINAL_SUMMARY_PROMPT,
             user,
-            reasoning_effort=SUMMARY_REASONING_EFFORT,
+            reasoning_effort=strategy.final_effort,
         )
 
-    # 第二轮审校（质量优先）
-    print(colored("   · 编辑审校（thinking max）…", "cyan"))
-    # 审校时附带压缩知识点清单（按页抽样+全量若不太长）
-    kb_lines = [i.as_line() for i in knowledge]
-    kb_blob = "\n".join(kb_lines)
-    if len(kb_blob) > 100_000:
-        # 过长则按页取每页前 2 条 + 全部页码列表
-        by_page: dict[int, list[str]] = {}
-        for item in knowledge:
-            by_page.setdefault(item.page, []).append(item.text)
-        sample = []
-        for p in sorted(by_page):
-            for t in by_page[p][:2]:
-                sample.append(f"[第 {p} 页] {t}")
-        kb_blob = (
-            "（知识点过长，以下为每页最多 2 条抽样；页码集合："
-            f"{sorted(by_page.keys())}）\n" + "\n".join(sample)
+    summary = draft
+    if strategy.do_review:
+        print(
+            colored(
+                f"   · 编辑审校（{strategy.review_effort}）…",
+                "cyan",
+            )
         )
+        kb_lines = [i.as_line() for i in knowledge]
+        kb_blob = "\n".join(kb_lines)
+        if len(kb_blob) > 100_000:
+            by_page: dict[int, list[str]] = {}
+            for item in knowledge:
+                by_page.setdefault(item.page, []).append(item.text)
+            sample = []
+            for p in sorted(by_page):
+                for t in by_page[p][:2]:
+                    sample.append(f"[第 {p} 页] {t}")
+            kb_blob = (
+                "（知识点过长，每页最多 2 条抽样；页码集合："
+                f"{sorted(by_page.keys())}）\n" + "\n".join(sample)
+            )
 
-    review_user = (
-        f"{toc_hint}{gold_hint}"
-        f"## 初稿\n\n{draft}\n\n"
-        f"## 原始知识点\n\n{kb_blob}\n"
-    )
-    summary = _chat_pro(
-        client,
-        REVIEW_SYSTEM_PROMPT,
-        review_user,
-        reasoning_effort=REVIEW_REASONING_EFFORT,
-    )
-    if not summary.strip():
-        print(colored("⚠️  审校输出为空，回退使用初稿", "yellow"))
-        summary = draft
+        review_user = (
+            f"{toc_hint}{gold_hint}"
+            f"## 初稿\n\n{draft}\n\n"
+            f"## 原始知识点\n\n{kb_blob}\n"
+        )
+        reviewed = _chat_summary_model(
+            client,
+            strategy,
+            REVIEW_SYSTEM_PROMPT,
+            review_user,
+            reasoning_effort=strategy.review_effort,
+        )
+        if reviewed.strip():
+            summary = reviewed
+        else:
+            print(colored("⚠️  审校输出为空，回退初稿", "yellow"))
+
+        cites = len(re.findall(r"第\s*\d+\s*页", summary or ""))
+        need = max(CITE_ESCALATE_MIN, total // 25)
+        if (
+            strategy.auto_escalate_review
+            and cites < need
+            and strategy.review_effort != "max"
+        ):
+            print(
+                colored(
+                    f"   · 页码引用偏少（约 {cites} < {need}），"
+                    f"自动升至 max 再审一轮…",
+                    "yellow",
+                )
+            )
+            boosted = _chat_summary_model(
+                client,
+                strategy,
+                REVIEW_SYSTEM_PROMPT,
+                review_user
+                + "\n\n【加严】上一版页码引用不足：请为每个 bullet 补全"
+                "（第 N 页），并对照知识点查漏。",
+                reasoning_effort="max",
+            )
+            if boosted.strip():
+                summary = boosted
 
     cites = len(re.findall(r"第\s*\d+\s*页", summary or ""))
     print(colored(f"✨ 总结完成（页码类引用约 {cites} 处）", "green"))
-    if cites < max(12, total // 25):
+    if cites < max(CITE_ESCALATE_MIN, total // 25):
         print(
             colored(
-                "⚠️  页码引用仍可能偏少；可删 md 后重跑或补充 gold。",
+                "⚠️  页码引用仍可能偏少；可换 quality 档或补充 gold 后重跑总结。",
                 "yellow",
             )
         )
@@ -948,6 +1502,7 @@ def save_summary(
     config: Config,
     summary: str,
     state: KnowledgeState,
+    strategy: PipelineStrategy,
 ) -> None:
     if not summary:
         print(colored("⏭️  无总结内容，未写入", "yellow"))
@@ -971,19 +1526,22 @@ def save_summary(
     content = f"""# 书籍分析：{config.pdf_name}
 
 - 生成时间：{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
-- 抽取模型：{MODEL_EXTRACT}（thinking）
-- 总结模型：{MODEL_SUMMARY}（thinking + 审校）
+- 策略：{strategy.name} — {strategy.description}
+- 抽取模型：{strategy.extract_model}{"（thinking）" if strategy.extract_thinking else ""}
+- 总结模型：{strategy.summary_model}（thinking {strategy.final_effort}
+  {("+ 审校 " + strategy.review_effort) if strategy.do_review else ""}）
 - 覆盖 PDF 页码：{page_range}
 - 知识点条数：{len(state.knowledge)}
 - 页码类引用（约）：{cite_n} 处
 {format_skip_meta(state)}
 - 说明：页码为 PDF 阅读器页码（从 1 起）。重写总结请先删除本文件再运行。
 - 可选金标准：同目录 `{config.gold_path.name}`
+- 策略：`--profile auto|economy|balanced|quality`（或环境变量 `{PROFILE_ENV}`）
 
 {summary.strip()}
 
 ---
-*由 PDF 书籍分析器（DeepSeek · 质量优先）生成*
+*由 PDF 书籍分析器（DeepSeek）生成*
 """
     print(colored(f"\n📝 写入总结：{config.summary_path}", "cyan"))
     # 原子写 md
@@ -1011,139 +1569,219 @@ def pages_complete(state: KnowledgeState, total_pages: int) -> bool:
     return state.next_page >= total_pages
 
 
-def main(argv: list[str] | None = None) -> None:
-    config = parse_args(argv)
+def _graceful_interrupt(
+    config: Config | None,
+    state: KnowledgeState | None,
+    *,
+    phase: str,
+) -> None:
+    """Ctrl+C：提示已保存进度，干净退出（码 130）。"""
+    print(file=sys.stderr)
     print(
-        colored(
-            f"""
-📚 PDF 书籍分析器（质量优先）
-----------------------------
-PDF：    {config.pdf_source}
-抽取：   {MODEL_EXTRACT} + thinking
-总结：   {MODEL_SUMMARY} + thinking + 审校
-进度：   {config.knowledge_path}
-总结：   {config.summary_path}
-金标准： {config.gold_path}（可选）
-""",
-            "cyan",
-        )
+        colored(f"⏹️  已中断（{phase}）。正在安全退出…", "yellow"),
+        file=sys.stderr,
     )
-
-    try:
-        setup_directories(config)
-    except FileNotFoundError as exc:
-        print(colored(f"⚠️  {exc}", "yellow"), file=sys.stderr)
-        raise SystemExit(1) from exc
-
-    state = load_knowledge_state(config)
-    pdf_document = pymupdf.open(config.pdf_path)
-    total_pages = pdf_document.page_count
-    toc = load_pdf_toc(pdf_document)
-    if toc:
-        print(colored(f"📑 读到 PDF 书签 {len(toc)} 条", "cyan"))
-    else:
-        print(colored("📑 无 PDF 书签（依赖邻页/下页上下文）", "yellow"))
-
-    extract_done = pages_complete(state, total_pages)
-    summary_exists = config.summary_path.exists()
-
-    if extract_done and summary_exists:
-        print(
-            colored(
-                f"\n✅ 已完成（抽取 {state.next_page}/{total_pages}，总结已存在）\n"
-                f"   总结：{config.summary_path}\n"
-                f"   重写总结 → 删除该 md 后再执行\n"
-                f"   人工润色 → 另存为 {config.gold_path.name} 供下次总结参考\n"
-                f"   重抽全书 → 删除 knowledge JSON 后再执行",
-                "green",
-            )
-        )
-        pdf_document.close()
-        print(colored("\n✨ 跳过，已退出 ✨", "green", attrs=["bold"]))
-        return
-
-    client = create_client()
-
-    try:
-        if not extract_done:
-            start = state.next_page
+    if state is not None and config is not None:
+        try:
+            # 再落盘一次，确保最近内存状态不丢
+            save_knowledge_state(config, state)
+        except Exception as exc:
             print(
-                colored(
-                    f"\n📚 共 {total_pages} 页，"
-                    f"处理第 {start + 1}–{total_pages} 页（Pro+thinking）…",
-                    "cyan",
-                )
-            )
-            for page_num in range(start, total_pages):
-                page_text = pdf_document[page_num].get_text()
-                state = process_page(
-                    client,
-                    config,
-                    page_text,
-                    state,
-                    page_num,
-                    total_pages,
-                    toc,
-                    pdf_document,
-                )
-        else:
-            print(
-                colored(
-                    f"\n✅ 抽取已完成（{state.next_page}/{total_pages}），"
-                    f"仅生成总结…",
-                    "green",
-                )
-            )
-
-        if not pages_complete(state, total_pages):
-            pdf_document.close()
-            print(colored("⚠️  进度异常，未完成抽取", "yellow"), file=sys.stderr)
-            raise SystemExit(1)
-
-        if config.summary_path.exists():
-            print(
-                colored(
-                    f"\n⚠️  总结文件已存在，请删除后再执行：\n"
-                    f"   {config.summary_path}",
-                    "yellow",
-                ),
+                colored(f"⚠️  退出前保存进度失败：{exc}", "yellow"),
                 file=sys.stderr,
             )
-            pdf_document.close()
-            raise SystemExit(1)
-
-        if not state.knowledge:
-            print(colored("⚠️  无知识点，无法生成总结", "yellow"), file=sys.stderr)
-            pdf_document.close()
-            raise SystemExit(1)
-
-        print(colored("\n📋 跳过统计", "cyan"))
-        print(format_skip_meta(state))
-
-        gold_notes = load_gold_notes(config.gold_path)
-        summary = generate_summary(
-            client,
-            state.knowledge,
-            gold_notes=gold_notes,
-            toc=toc,
-        )
-        save_summary(config, summary, state)
-
-    except (APIStatusError, APIError, APIConnectionError, APITimeoutError) as exc:
-        print(colored(f"\n⚠️  {format_api_error(exc)}", "yellow"), file=sys.stderr)
         print(
             colored(
-                f"进度 next_page={state.next_page}，"
-                f"知识点 {len(state.knowledge)} 条已保存。",
+                f"   进度已保留：next_page={state.next_page}，"
+                f"知识点 {len(state.knowledge)} 条\n"
+                f"   文件：{config.knowledge_path}\n"
+                f"   下次直接再跑同一命令即可续跑。",
                 "cyan",
             ),
             file=sys.stderr,
         )
-        pdf_document.close()
-        raise SystemExit(1) from None
+    else:
+        print(
+            colored("   （尚未开始写进度，或进度文件未创建）", "cyan"),
+            file=sys.stderr,
+        )
+    raise SystemExit(130)
 
-    pdf_document.close()
-    print(colored("\n✨ 处理完成 ✨", "green", attrs=["bold"]))
+
+def main(argv: list[str] | None = None) -> None:
+    config: Config | None = None
+    state: KnowledgeState | None = None
+    pdf_document: pymupdf.Document | None = None
+
+    try:
+        config = parse_args(argv)
+        print(
+            colored(
+                f"""
+📚 PDF 书籍分析器
+----------------
+PDF：    {config.pdf_source}
+档位：   {config.profile_name}
+进度：   {config.knowledge_path}
+总结：   {config.summary_path}
+金标准： {config.gold_path}（可选）
+切换：   --profile auto|economy|balanced|quality
+提示：   Ctrl+C 可中断，已处理页进度会保留
+""",
+                "cyan",
+            )
+        )
+
+        try:
+            setup_directories(config)
+        except FileNotFoundError as exc:
+            print(colored(f"⚠️  {exc}", "yellow"), file=sys.stderr)
+            raise SystemExit(1) from exc
+
+        state = load_knowledge_state(config)
+        pdf_document = pymupdf.open(config.pdf_path)
+        total_pages = pdf_document.page_count
+        toc = load_pdf_toc(pdf_document)
+        if toc:
+            print(colored(f"📑 读到 PDF 书签 {len(toc)} 条", "cyan"))
+        else:
+            print(colored("📑 无 PDF 书签（依赖邻页/下页上下文）", "yellow"))
+
+        extract_done = pages_complete(state, total_pages)
+        summary_exists = config.summary_path.exists()
+
+        if extract_done and summary_exists:
+            print(
+                colored(
+                    f"\n✅ 已完成（抽取 {state.next_page}/{total_pages}，总结已存在）\n"
+                    f"   总结：{config.summary_path}\n"
+                    f"   重写总结 → 删除该 md 后再执行\n"
+                    f"   人工润色 → 另存为 {config.gold_path.name} 供下次总结参考\n"
+                    f"   重抽全书 → 删除 knowledge JSON 后再执行\n"
+                    f"   换策略 → --profile … 后重跑"
+                    f"（总结立即生效；抽取模型变化须重抽）",
+                    "green",
+                )
+            )
+            print(colored("\n✨ 跳过，已退出 ✨", "green", attrs=["bold"]))
+            return
+
+        client = create_client()
+
+        # —— 策略：auto 预读评估；固定档只按页数微调 ——
+        profile = config.profile_name.strip().lower()
+        if profile == "auto":
+            sample_idx = pick_preflight_pages(total_pages)
+            samples = collect_preflight_samples(pdf_document, sample_idx)
+            assessment = run_preflight_assessment(
+                client,
+                samples,
+                total_pages=total_pages,
+                has_toc=bool(toc),
+            )
+            strategy = strategy_from_assessment(
+                assessment, total_pages=total_pages
+            )
+        else:
+            strategy = resolve_strategy(
+                config.profile_name, total_pages=total_pages
+            )
+        print(colored(f"⚙️  生效策略：{strategy.label()}", "cyan"))
+        print(colored(f"   {strategy.description}", "cyan"))
+
+        try:
+            if not extract_done:
+                start = state.next_page
+                print(
+                    colored(
+                        f"\n📚 共 {total_pages} 页，"
+                        f"处理第 {start + 1}–{total_pages} 页"
+                        f"（{strategy.extract_model}）…",
+                        "cyan",
+                    )
+                )
+                for page_num in range(start, total_pages):
+                    page_text = pdf_document[page_num].get_text()
+                    state = process_page(
+                        client,
+                        config,
+                        page_text,
+                        state,
+                        page_num,
+                        total_pages,
+                        toc,
+                        pdf_document,
+                        strategy,
+                    )
+            else:
+                print(
+                    colored(
+                        f"\n✅ 抽取已完成（{state.next_page}/{total_pages}），"
+                        f"仅生成总结…",
+                        "green",
+                    )
+                )
+
+            if not pages_complete(state, total_pages):
+                print(colored("⚠️  进度异常，未完成抽取", "yellow"), file=sys.stderr)
+                raise SystemExit(1)
+
+            if config.summary_path.exists():
+                print(
+                    colored(
+                        f"\n⚠️  总结文件已存在，请删除后再执行：\n"
+                        f"   {config.summary_path}",
+                        "yellow",
+                    ),
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
+
+            if not state.knowledge:
+                print(
+                    colored("⚠️  无知识点，无法生成总结", "yellow"),
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
+
+            print(colored("\n📋 跳过统计", "cyan"))
+            print(format_skip_meta(state))
+
+            gold_notes = load_gold_notes(config.gold_path)
+            summary = generate_summary(
+                client,
+                state.knowledge,
+                strategy,
+                gold_notes=gold_notes,
+                toc=toc,
+            )
+            save_summary(config, summary, state, strategy)
+
+        except (APIStatusError, APIError, APIConnectionError, APITimeoutError) as exc:
+            print(
+                colored(f"\n⚠️  {format_api_error(exc)}", "yellow"),
+                file=sys.stderr,
+            )
+            print(
+                colored(
+                    f"进度 next_page={state.next_page}，"
+                    f"知识点 {len(state.knowledge)} 条已保存。",
+                    "cyan",
+                ),
+                file=sys.stderr,
+            )
+            raise SystemExit(1) from None
+
+        print(colored("\n✨ 处理完成 ✨", "green", attrs=["bold"]))
+
+    except KeyboardInterrupt:
+        _graceful_interrupt(config, state, phase="用户 Ctrl+C")
+    finally:
+        if pdf_document is not None:
+            try:
+                pdf_document.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
