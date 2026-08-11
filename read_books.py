@@ -1,3 +1,10 @@
+"""
+PDF Book Analyzer — page-by-page knowledge extraction and summarization.
+
+Requires OPENAI_API_KEY in the environment.
+Place a PDF in the project root and set PDF_NAME below.
+"""
+
 from pathlib import Path
 from typing import Dict, Any, Optional
 from pydantic import BaseModel
@@ -7,8 +14,6 @@ import fitz  # PyMuPDF
 from termcolor import colored
 from datetime import datetime
 import shutil
-
-# source for the infinite descent book: https://infinitedescent.xyz/dl/infdesc.pdf
 
 # Configuration Constants
 PDF_NAME = "meditations.pdf"
