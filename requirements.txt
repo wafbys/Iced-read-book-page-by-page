@@ -1,5 +1,7 @@
-pydantic
-openai
-pymupdf
-termcolor
+pydantic>=2.6,<3
+openai>=1.40,<3
+pymupdf>=1.24,<2
+termcolor>=2.4,<4
 
+# 开发 / 测试（可选）
+pytest>=8.0,<9

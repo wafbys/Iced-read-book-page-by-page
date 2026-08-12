@@ -4,20 +4,23 @@ PDF 书籍分析器 — 逐页提取知识点，生成一篇带页码的总结�
 用法：
   python read_books.py book.pdf
   python read_books.py book.pdf --profile auto|economy|balanced|quality
+  python read_books.py book.pdf --out-dir ./out
 
-  auto     — 预读评估后动态选 Flash/Pro、high/max（默认）
-  economy  — 固定省钱：全 Flash，无审校
+  auto     — 预读评估后动态选 Flash/Pro、high/max（默认；策略写入进度）
+  economy  — 固定省钱：全 Flash，无审校，总结关 thinking
   balanced — 固定平衡：Flash 抽 + Pro 结/审 high
   quality  — 固定最强：Pro 抽+thinking；结/审 max
 
 未传 --profile 时可读环境变量 READ_BOOKS_PROFILE。
-产出：book_analysis/<书名>.pdf | _knowledge.json | .md
+也可选加载项目根目录 .env（不覆盖已有环境变量）。
+产出：<out-dir>/<书名>.pdf | _knowledge.json | .md（默认 out-dir=book_analysis）
 Ctrl+C 可中断并保留进度。API Key：DEEPSEEK_API_KEY。
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -25,7 +28,7 @@ import shutil
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime
 from pathlib import Path
 
@@ -54,6 +57,8 @@ API_RETRY_BASE_SECONDS = 2.0
 EXTRACT_TEMPERATURE = 0.15
 SUMMARY_TEMPERATURE = 0.2
 EXTRACT_MAX_TOKENS = 4_096
+# thinking 时 reasoning 与 content 共用预算，需更大 completion 上限
+EXTRACT_MAX_TOKENS_THINKING = 16_384
 SUMMARY_MAX_TOKENS = 32_768
 GOLD_MAX_CHARS = 40_000
 EXTRACT_RETRY_ON_EMPTY = True
@@ -62,11 +67,12 @@ CITE_ESCALATE_MIN = 12
 # auto 预读：采样页数（实质性正文页）
 PREFLIGHT_SAMPLE_TARGET = 5
 PREFLIGHT_CHARS_PER_PAGE = 2_500
+DEFAULT_OUT_DIR = "book_analysis"
+HASH_CHUNK_SIZE = 1024 * 1024
 
 EXTRA_BODY_NO_THINKING = {"thinking": {"type": "disabled"}}
 EXTRA_BODY_THINKING = {"thinking": {"type": "enabled"}}
 
-BASE_DIR = Path("book_analysis")
 PROFILE_ENV = "READ_BOOKS_PROFILE"
 VALID_PROFILES = ("auto", "economy", "balanced", "quality")
 
@@ -87,32 +93,45 @@ class PipelineStrategy:
     auto_escalate_review: bool  # 页码稀 → 再 max 审一轮
     summary_chunk_chars: int
     description: str
+    summary_thinking: bool = True  # economy 可关，省钱
 
     def label(self) -> str:
         ext_t = "+thinking" if self.extract_thinking else ""
+        sum_t = "" if self.summary_thinking else " no-think"
         rev = f"审校:{self.review_effort}" if self.do_review else "无审校"
         return (
             f"{self.name} | 抽:{self.extract_model}{ext_t} | "
-            f"结:{self.summary_model}({self.final_effort}) | {rev}"
+            f"结:{self.summary_model}({self.final_effort}{sum_t}) | {rev}"
         )
 
     def with_updates(self, **kwargs) -> PipelineStrategy:
-        data = {
-            "name": self.name,
-            "extract_model": self.extract_model,
-            "summary_model": self.summary_model,
-            "extract_thinking": self.extract_thinking,
-            "extract_effort": self.extract_effort,
-            "partial_effort": self.partial_effort,
-            "final_effort": self.final_effort,
-            "review_effort": self.review_effort,
-            "do_review": self.do_review,
-            "auto_escalate_review": self.auto_escalate_review,
-            "summary_chunk_chars": self.summary_chunk_chars,
-            "description": self.description,
-        }
-        data.update(kwargs)
-        return PipelineStrategy(**data)
+        return replace(self, **kwargs)
+
+    def to_spec(self) -> dict:
+        return asdict(self)
+
+    @staticmethod
+    def from_spec(data: dict) -> PipelineStrategy | None:
+        """从 knowledge meta 恢复策略；字段不全或非法则返回 None。"""
+        if not isinstance(data, dict):
+            return None
+        try:
+            kwargs = {}
+            for f in fields(PipelineStrategy):
+                if f.name not in data:
+                    if f.name == "summary_thinking":
+                        kwargs[f.name] = True  # 旧进度兼容
+                        continue
+                    return None
+                kwargs[f.name] = data[f.name]
+            s = PipelineStrategy(**kwargs)
+            if s.final_effort not in ("high", "max"):
+                return None
+            if s.review_effort not in ("high", "max"):
+                return None
+            return s
+        except (TypeError, ValueError, KeyError):
+            return None
 
 
 class PreflightAssessment(BaseModel):
@@ -172,7 +191,8 @@ def _base_profiles() -> dict[str, PipelineStrategy]:
             do_review=False,
             auto_escalate_review=False,
             summary_chunk_chars=80_000,
-            description="省钱：全 Flash，无审校",
+            description="省钱：全 Flash，无审校，总结关闭 thinking",
+            summary_thinking=False,
         ),
         "balanced": PipelineStrategy(
             name="balanced",
@@ -187,6 +207,7 @@ def _base_profiles() -> dict[str, PipelineStrategy]:
             auto_escalate_review=True,
             summary_chunk_chars=100_000,
             description="固定平衡：Flash 抽 + Pro 结/审 high",
+            summary_thinking=True,
         ),
         "quality": PipelineStrategy(
             name="quality",
@@ -201,6 +222,7 @@ def _base_profiles() -> dict[str, PipelineStrategy]:
             auto_escalate_review=True,
             summary_chunk_chars=140_000,
             description="固定最强：Pro 抽+thinking；结/审 max",
+            summary_thinking=True,
         ),
         # auto 占位；真正参数由预读评估填充
         "auto": PipelineStrategy(
@@ -216,6 +238,7 @@ def _base_profiles() -> dict[str, PipelineStrategy]:
             auto_escalate_review=True,
             summary_chunk_chars=100_000,
             description="预读评估后动态决定 Flash/Pro 与 high/max",
+            summary_thinking=True,
         ),
     }
 
@@ -298,6 +321,11 @@ def strategy_from_assessment(
     if rationale:
         desc += f"；{rationale}"
 
+    # 极简书可用非 thinking 总结以省钱；其余 auto 保持 thinking
+    summary_thinking = not (
+        assessment.difficulty <= 1 and assessment.text_noise <= 2
+    )
+
     return PipelineStrategy(
         name="auto",
         extract_model=extract_model,
@@ -311,6 +339,7 @@ def strategy_from_assessment(
         auto_escalate_review=auto_esc,
         summary_chunk_chars=chunk,
         description=desc,
+        summary_thinking=summary_thinking,
     )
 
 
@@ -513,19 +542,28 @@ def run_preflight_assessment(
     return assessment
 
 API_KEY_SETUP_HELP = """
-请在系统环境中设置 DEEPSEEK_API_KEY，不要把 Key 写进项目。
+请在系统环境中设置 DEEPSEEK_API_KEY，不要把 Key 写进仓库。
 
 【当前会话】
-  PowerShell:  $env:DEEPSEEK_API_KEY = "sk-..."
-  CMD:         set DEEPSEEK_API_KEY=sk-...
+  Linux / macOS (bash/zsh):  export DEEPSEEK_API_KEY="sk-..."
+  PowerShell:                $env:DEEPSEEK_API_KEY = "sk-..."
+  CMD:                       set DEEPSEEK_API_KEY=sk-...
+
+【可选 .env】
+  项目根目录创建 .env（参考 .env.example）：
+    DEEPSEEK_API_KEY=sk-...
+  启动时会加载，且不覆盖已在 shell 中设置的变量。
 
 【永久·用户级】
+  Linux / macOS:  写入 shell 配置后重开终端，例如：
+    echo 'export DEEPSEEK_API_KEY="sk-..."' >> ~/.bashrc   # bash
+    echo 'export DEEPSEEK_API_KEY="sk-..."' >> ~/.zshrc    # zsh
   PowerShell:
     [System.Environment]::SetEnvironmentVariable(
       "DEEPSEEK_API_KEY", "sk-...", "User")
   CMD:  setx DEEPSEEK_API_KEY "sk-..."  （需新开终端）
 
-详见 README「配置 API Key」。
+详见 README「API Key」。
 """.strip()
 
 
@@ -538,6 +576,7 @@ class Config:
     summary_path: Path
     gold_path: Path
     profile_name: str
+    out_dir: Path
 
 
 @dataclass
@@ -559,6 +598,15 @@ class KnowledgeState:
     skipped_blank: list[int]
     skipped_model: list[int]
     skipped_parse: list[int]
+
+
+@dataclass
+class ProgressLoad:
+    """knowledge JSON 加载结果（含 meta / 可恢复策略）。"""
+
+    state: KnowledgeState
+    meta: dict
+    stored_strategy: PipelineStrategy | None
 
 
 class PageContent(BaseModel):
@@ -673,6 +721,40 @@ def normalize_knowledge_list(raw: list) -> list[KnowledgeItem]:
     return items
 
 
+def load_dotenv_if_present(path: Path | None = None) -> None:
+    """可选加载 .env：不覆盖已有环境变量；无 python-dotenv 依赖。"""
+    env_path = path or Path(".env")
+    if not env_path.is_file():
+        return
+    try:
+        text = env_path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        os.environ[key] = value
+
+
+def file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(HASH_CHUNK_SIZE)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def parse_args(argv: list[str] | None = None) -> Config:
     parser = argparse.ArgumentParser(
         prog="read_books.py",
@@ -687,6 +769,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
             "  balanced  固定平衡：Flash 抽 + Pro 结/审 high\n"
             "  quality   固定最强：Pro 抽+thinking；结/审 max\n"
             f"未指定 --profile 时可读环境变量 {PROFILE_ENV}。\n"
+            "输出目录默认 ./book_analysis（相对当前工作目录）；可用 --out-dir 指定。\n"
         ),
     )
     parser.add_argument("pdf", help="PDF 路径或文件名")
@@ -697,6 +780,11 @@ def parse_args(argv: list[str] | None = None) -> Config:
         default=None,
         help="流水线策略档（默认 auto；也可用环境变量 "
         f"{PROFILE_ENV}）",
+    )
+    parser.add_argument(
+        "--out-dir",
+        default=DEFAULT_OUT_DIR,
+        help=f"产出目录（默认 {DEFAULT_OUT_DIR}，相对当前工作目录）",
     )
     args = parser.parse_args(argv)
 
@@ -719,16 +807,18 @@ def parse_args(argv: list[str] | None = None) -> Config:
             )
             profile = "auto"
 
+    out_dir = Path(args.out_dir)
     pdf_name = source.name
     stem = source.stem
     return Config(
         pdf_name=pdf_name,
         pdf_source=source,
-        pdf_path=BASE_DIR / pdf_name,
-        knowledge_path=BASE_DIR / f"{stem}_knowledge.json",
-        summary_path=BASE_DIR / f"{stem}.md",
-        gold_path=BASE_DIR / f"{stem}_gold.md",
+        pdf_path=out_dir / pdf_name,
+        knowledge_path=out_dir / f"{stem}_knowledge.json",
+        summary_path=out_dir / f"{stem}.md",
+        gold_path=out_dir / f"{stem}_gold.md",
         profile_name=profile,
+        out_dir=out_dir,
     )
 
 
@@ -799,7 +889,7 @@ def chat_create_with_retry(client: OpenAI, **kwargs):
 
 
 def setup_directories(config: Config) -> None:
-    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    config.out_dir.mkdir(parents=True, exist_ok=True)
 
     if not config.pdf_path.exists():
         if config.pdf_source.exists():
@@ -811,6 +901,26 @@ def setup_directories(config: Config) -> None:
         config.pdf_source.exists()
         and config.pdf_source.resolve() != config.pdf_path.resolve()
     ):
+        # 若已有进度且指纹与源 PDF 不一致，拒绝静默覆盖（防同名换书）
+        if config.knowledge_path.exists():
+            try:
+                with open(config.knowledge_path, "r", encoding="utf-8") as f:
+                    existing = json.load(f)
+                stored_sha = (existing.get("meta") or {}).get("pdf_sha256")
+                if stored_sha:
+                    source_sha = file_sha256(config.pdf_source)
+                    if source_sha != stored_sha:
+                        raise SystemExit(
+                            "❌ 源 PDF 内容与进度文件中的指纹不一致（可能同名换书）。\n"
+                            f"   进度：{config.knowledge_path}\n"
+                            f"   源 PDF：{config.pdf_source}\n"
+                            "   若确认是新书：删除 knowledge JSON 后重跑；\n"
+                            "   若仍是同一本书：请恢复原 PDF 或检查路径。"
+                        )
+            except SystemExit:
+                raise
+            except (OSError, json.JSONDecodeError, TypeError):
+                pass
         shutil.copy2(config.pdf_source, config.pdf_path)
         print(colored(f"📄 已更新 PDF 副本 → {config.pdf_path}", "green"))
 
@@ -838,6 +948,8 @@ def save_knowledge_state(
     config: Config,
     state: KnowledgeState,
     strategy: PipelineStrategy | None = None,
+    *,
+    pdf_page_count: int | None = None,
 ) -> None:
     print(
         colored(
@@ -846,16 +958,48 @@ def save_knowledge_state(
             "blue",
         )
     )
-    meta = {
+    # 无 strategy 时保留旧 meta 中的策略/指纹，避免 Ctrl+C 二次保存冲掉
+    prev_meta: dict = {}
+    if config.knowledge_path.exists():
+        try:
+            with open(config.knowledge_path, "r", encoding="utf-8") as f:
+                prev = json.load(f)
+            if isinstance(prev.get("meta"), dict):
+                prev_meta = prev["meta"]
+        except (OSError, json.JSONDecodeError, TypeError):
+            prev_meta = {}
+
+    meta: dict = {
         "updated_at": datetime.now().isoformat(timespec="seconds"),
         "profile": config.profile_name,
     }
+    for key in (
+        "pdf_sha256",
+        "pdf_size",
+        "pdf_page_count",
+        "model_extract",
+        "model_summary",
+        "strategy",
+        "strategy_spec",
+    ):
+        if key in prev_meta:
+            meta[key] = prev_meta[key]
+
+    try:
+        if config.pdf_path.exists():
+            meta["pdf_sha256"] = file_sha256(config.pdf_path)
+            meta["pdf_size"] = config.pdf_path.stat().st_size
+    except OSError as exc:
+        print(colored(f"⚠️  无法计算 PDF 指纹：{exc}", "yellow"), file=sys.stderr)
+    if pdf_page_count is not None:
+        meta["pdf_page_count"] = pdf_page_count
     if strategy is not None:
         meta.update(
             {
                 "model_extract": strategy.extract_model,
                 "model_summary": strategy.summary_model,
                 "strategy": strategy.label(),
+                "strategy_spec": strategy.to_spec(),
             }
         )
     payload = {
@@ -871,14 +1015,35 @@ def save_knowledge_state(
     atomic_write_json(config.knowledge_path, payload)
 
 
-def load_knowledge_state(config: Config) -> KnowledgeState:
+def load_knowledge_state(config: Config) -> ProgressLoad:
     if not config.knowledge_path.exists():
         print(colored("🆕 新建进度", "cyan"))
-        return empty_state()
+        return ProgressLoad(state=empty_state(), meta={}, stored_strategy=None)
 
     print(colored("📚 加载进度 JSON…", "cyan"))
-    with open(config.knowledge_path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+    try:
+        with open(config.knowledge_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as exc:
+        print(
+            colored(
+                f"❌ knowledge JSON 损坏，无法解析：{config.knowledge_path}\n"
+                f"   {exc}\n"
+                "   修复：删除该文件后重跑（将丢失已抽进度）。",
+                "yellow",
+            ),
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from exc
+    except OSError as exc:
+        print(
+            colored(
+                f"❌ 无法读取 knowledge：{config.knowledge_path}\n   {exc}",
+                "yellow",
+            ),
+            file=sys.stderr,
+        )
+        raise SystemExit(1) from exc
 
     if "next_page" not in data:
         print(
@@ -892,20 +1057,108 @@ def load_knowledge_state(config: Config) -> KnowledgeState:
 
     skipped = data.get("skipped") or {}
     points = normalize_knowledge_list(data.get("knowledge") or [])
-    next_page = int(data["next_page"])
+    try:
+        next_page = int(data["next_page"])
+    except (TypeError, ValueError):
+        print(
+            colored(
+                f"❌ knowledge 中 next_page 非法：{data.get('next_page')!r}\n"
+                f"   请删除或手工修复：{config.knowledge_path}",
+                "yellow",
+            ),
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    meta = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+    stored = PipelineStrategy.from_spec(meta.get("strategy_spec") or {})
     print(
         colored(
             f"✅ {len(points)} 条知识点，下一页 = 第 {next_page + 1} 页",
             "green",
         )
     )
-    return KnowledgeState(
-        knowledge=points,
-        next_page=next_page,
-        skipped_blank=list(skipped.get("blank") or []),
-        skipped_model=list(skipped.get("no_content") or []),
-        skipped_parse=list(skipped.get("parse_error") or []),
+    return ProgressLoad(
+        state=KnowledgeState(
+            knowledge=points,
+            next_page=next_page,
+            skipped_blank=list(skipped.get("blank") or []),
+            skipped_model=list(skipped.get("no_content") or []),
+            skipped_parse=list(skipped.get("parse_error") or []),
+        ),
+        meta=meta,
+        stored_strategy=stored,
     )
+
+
+def validate_progress(
+    progress: ProgressLoad,
+    config: Config,
+    total_pages: int,
+) -> None:
+    """校验 next_page 边界与 PDF 指纹，防止同名换书或损坏进度。"""
+    state = progress.state
+    if total_pages < 0:
+        print(colored("❌ PDF 页数异常", "yellow"), file=sys.stderr)
+        raise SystemExit(1)
+
+    if not (0 <= state.next_page <= total_pages):
+        print(
+            colored(
+                f"❌ 进度 next_page={state.next_page} 非法"
+                f"（合法范围 0–{total_pages}）。\n"
+                f"   文件：{config.knowledge_path}\n"
+                "   请删除 knowledge JSON 后重跑，或手工修正 next_page。",
+                "yellow",
+            ),
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    meta = progress.meta
+    stored_sha = meta.get("pdf_sha256")
+    if stored_sha and config.pdf_path.exists():
+        try:
+            current_sha = file_sha256(config.pdf_path)
+        except OSError as exc:
+            print(
+                colored(f"❌ 无法读取 PDF 以校验指纹：{exc}", "yellow"),
+                file=sys.stderr,
+            )
+            raise SystemExit(1) from exc
+        if current_sha != stored_sha:
+            print(
+                colored(
+                    "❌ PDF 内容与进度指纹不一致（可能同名换了文件）。\n"
+                    f"   进度：{config.knowledge_path}\n"
+                    f"   PDF：  {config.pdf_path}\n"
+                    f"   进度指纹：{stored_sha[:16]}…\n"
+                    f"   当前指纹：{current_sha[:16]}…\n"
+                    "   处理：删除 knowledge JSON 后按新书重抽；"
+                    "或恢复与进度匹配的 PDF。",
+                    "yellow",
+                ),
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+
+    stored_pages = meta.get("pdf_page_count")
+    if stored_pages is not None:
+        try:
+            stored_n = int(stored_pages)
+        except (TypeError, ValueError):
+            stored_n = -1
+        if stored_n >= 0 and stored_n != total_pages:
+            print(
+                colored(
+                    f"❌ 进度记录页数={stored_n}，当前 PDF 页数={total_pages}，不一致。\n"
+                    f"   文件：{config.knowledge_path}\n"
+                    "   请删除 knowledge JSON 后重跑。",
+                    "yellow",
+                ),
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
 
 
 def is_blank_page(page_text: str) -> bool:
@@ -1064,26 +1317,54 @@ def _extract_once(
             "请更仔细扫描定义、命题与例子；仅当确为目录/索引/空白才 has_content=false。"
         )
 
-    kwargs: dict = {
-        "model": strategy.extract_model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_content},
-        ],
-        "response_format": {"type": "json_object"},
-        "temperature": EXTRACT_TEMPERATURE,
-        "max_tokens": EXTRACT_MAX_TOKENS,
-        "extra_body": (
-            EXTRA_BODY_THINKING
-            if strategy.extract_thinking
-            else EXTRA_BODY_NO_THINKING
-        ),
-    }
-    if strategy.extract_thinking:
-        kwargs["reasoning_effort"] = strategy.extract_effort
+    use_thinking = strategy.extract_thinking
+    max_tokens = (
+        EXTRACT_MAX_TOKENS_THINKING if use_thinking else EXTRACT_MAX_TOKENS
+    )
 
-    completion = chat_create_with_retry(client, **kwargs)
-    raw = completion.choices[0].message.content or "{}"
+    def _call(*, thinking: bool, tokens: int) -> str:
+        kwargs: dict = {
+            "model": strategy.extract_model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_content},
+            ],
+            "response_format": {"type": "json_object"},
+            "temperature": EXTRACT_TEMPERATURE,
+            "max_tokens": tokens,
+            "extra_body": (
+                EXTRA_BODY_THINKING if thinking else EXTRA_BODY_NO_THINKING
+            ),
+        }
+        if thinking:
+            kwargs["reasoning_effort"] = strategy.extract_effort
+        completion = chat_create_with_retry(client, **kwargs)
+        return (completion.choices[0].message.content or "").strip()
+
+    raw = _call(thinking=use_thinking, tokens=max_tokens)
+
+    # thinking 占满预算时常返回空 content；抬高上限再试，仍空则关 thinking
+    if not raw and use_thinking:
+        bumped = max(max_tokens * 2, EXTRACT_MAX_TOKENS_THINKING)
+        print(
+            colored(
+                "⚠️  抽页 content 为空（thinking 可能占满 max_tokens），"
+                f"提高预算至 {bumped} 重试…",
+                "yellow",
+            )
+        )
+        raw = _call(thinking=True, tokens=bumped)
+    if not raw and use_thinking:
+        print(
+            colored(
+                "⚠️  仍为空，关闭 thinking 再抽本页…",
+                "yellow",
+            )
+        )
+        raw = _call(thinking=False, tokens=EXTRACT_MAX_TOKENS)
+
+    if not raw:
+        raw = "{}"
     return PageContent.model_validate(json.loads(raw))
 
 
@@ -1112,7 +1393,9 @@ def process_page(
             skipped_model=state.skipped_model,
             skipped_parse=state.skipped_parse,
         )
-        save_knowledge_state(config, state, strategy)
+        save_knowledge_state(
+            config, state, strategy, pdf_page_count=total_pages
+        )
         return state
 
     ctx_parts = [f"全书共 {total_pages} 页；当前为第 {pdf_page} 页。"]
@@ -1155,7 +1438,9 @@ def process_page(
                 skipped_model=state.skipped_model,
                 skipped_parse=state.skipped_parse + [pdf_page],
             )
-            save_knowledge_state(config, state, strategy)
+            save_knowledge_state(
+                config, state, strategy, pdf_page_count=total_pages
+            )
             return state
 
     if result.has_content and result.knowledge:
@@ -1183,7 +1468,9 @@ def process_page(
         skipped_model=skipped_model,
         skipped_parse=state.skipped_parse,
     )
-    save_knowledge_state(config, state, strategy)
+    save_knowledge_state(
+        config, state, strategy, pdf_page_count=total_pages
+    )
     return state
 
 
@@ -1231,20 +1518,25 @@ def _chat_summary_model(
     temperature: float = SUMMARY_TEMPERATURE,
     max_tokens: int = SUMMARY_MAX_TOKENS,
 ) -> str:
-    completion = chat_create_with_retry(
-        client,
-        model=strategy.summary_model,
-        messages=[
+    use_thinking = strategy.summary_thinking
+    kwargs: dict = {
+        "model": strategy.summary_model,
+        "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
-        temperature=temperature,
-        max_tokens=max_tokens,
-        reasoning_effort=reasoning_effort,
-        extra_body=EXTRA_BODY_THINKING,
-    )
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "extra_body": (
+            EXTRA_BODY_THINKING if use_thinking else EXTRA_BODY_NO_THINKING
+        ),
+    }
+    if use_thinking:
+        kwargs["reasoning_effort"] = reasoning_effort
+
+    completion = chat_create_with_retry(client, **kwargs)
     content = completion.choices[0].message.content or ""
-    if not content.strip():
+    if not content.strip() and use_thinking:
         print(
             colored(
                 "⚠️  模型 content 为空（thinking 可能占满 max_tokens），重试一次…",
@@ -1268,6 +1560,29 @@ def _chat_summary_model(
             extra_body=EXTRA_BODY_THINKING,
         )
         content = completion.choices[0].message.content or ""
+    if not content.strip() and use_thinking:
+        print(
+            colored(
+                "⚠️  仍为空，关闭 thinking 再生成…",
+                "yellow",
+            )
+        )
+        completion = chat_create_with_retry(
+            client,
+            model=strategy.summary_model,
+            messages=[
+                {"role": "system", "content": system},
+                {
+                    "role": "user",
+                    "content": user
+                    + "\n\n请直接给出完整最终答案正文，确保 content 非空。",
+                },
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens,
+            extra_body=EXTRA_BODY_NO_THINKING,
+        )
+        content = completion.choices[0].message.content or ""
     return content
 
 
@@ -1288,10 +1603,10 @@ def generate_summary(
     *,
     gold_notes: str = "",
     toc: list[tuple[int, str, int]] | None = None,
-) -> str:
+) -> tuple[str, PipelineStrategy]:
     if not knowledge:
         print(colored("\n⚠️  无知识点，无法总结", "yellow"))
-        return ""
+        return "", strategy
 
     knowledge = dedupe_knowledge(knowledge)
     kb_chars = sum(len(i.text) for i in knowledge)
@@ -1473,7 +1788,7 @@ def generate_summary(
                 "yellow",
             )
         )
-    return summary
+    return summary, strategy
 
 
 def format_skip_meta(state: KnowledgeState) -> str:
@@ -1528,7 +1843,7 @@ def save_summary(
 - 生成时间：{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 - 策略：{strategy.name} — {strategy.description}
 - 抽取模型：{strategy.extract_model}{"（thinking）" if strategy.extract_thinking else ""}
-- 总结模型：{strategy.summary_model}（thinking {strategy.final_effort}
+- 总结模型：{strategy.summary_model}（{"thinking " + strategy.final_effort if strategy.summary_thinking else "no-thinking"}
   {("+ 审校 " + strategy.review_effort) if strategy.do_review else ""}）
 - 覆盖 PDF 页码：{page_range}
 - 知识点条数：{len(state.knowledge)}
@@ -1612,8 +1927,11 @@ def main(argv: list[str] | None = None) -> None:
     config: Config | None = None
     state: KnowledgeState | None = None
     pdf_document: pymupdf.Document | None = None
+    active_strategy: PipelineStrategy | None = None
+    total_pages_for_save: int | None = None
 
     try:
+        load_dotenv_if_present()
         config = parse_args(argv)
         print(
             colored(
@@ -1622,6 +1940,7 @@ def main(argv: list[str] | None = None) -> None:
 ----------------
 PDF：    {config.pdf_source}
 档位：   {config.profile_name}
+产出目录：{config.out_dir}
 进度：   {config.knowledge_path}
 总结：   {config.summary_path}
 金标准： {config.gold_path}（可选）
@@ -1638,9 +1957,23 @@ PDF：    {config.pdf_source}
             print(colored(f"⚠️  {exc}", "yellow"), file=sys.stderr)
             raise SystemExit(1) from exc
 
-        state = load_knowledge_state(config)
-        pdf_document = pymupdf.open(config.pdf_path)
+        progress = load_knowledge_state(config)
+        state = progress.state
+        try:
+            pdf_document = pymupdf.open(config.pdf_path)
+        except Exception as exc:
+            print(
+                colored(
+                    f"❌ 无法打开 PDF：{config.pdf_path}\n   {exc}",
+                    "yellow",
+                ),
+                file=sys.stderr,
+            )
+            raise SystemExit(1) from exc
         total_pages = pdf_document.page_count
+        total_pages_for_save = total_pages
+        validate_progress(progress, config, total_pages)
+
         toc = load_pdf_toc(pdf_document)
         if toc:
             print(colored(f"📑 读到 PDF 书签 {len(toc)} 条", "cyan"))
@@ -1668,26 +2001,60 @@ PDF：    {config.pdf_source}
 
         client = create_client()
 
-        # —— 策略：auto 预读评估；固定档只按页数微调 ——
+        # —— 策略：auto 优先复用进度中的决议；固定档按请求解析 ——
         profile = config.profile_name.strip().lower()
+        kb_chars = sum(len(i.text) for i in state.knowledge) or None
         if profile == "auto":
-            sample_idx = pick_preflight_pages(total_pages)
-            samples = collect_preflight_samples(pdf_document, sample_idx)
-            assessment = run_preflight_assessment(
-                client,
-                samples,
-                total_pages=total_pages,
-                has_toc=bool(toc),
+            can_reuse = (
+                progress.stored_strategy is not None
+                and progress.stored_strategy.name == "auto"
+                and (state.next_page > 0 or extract_done)
             )
-            strategy = strategy_from_assessment(
-                assessment, total_pages=total_pages
-            )
+            if can_reuse:
+                strategy = resolve_strategy(
+                    "auto",
+                    total_pages=total_pages,
+                    knowledge_chars=kb_chars,
+                    prebuilt=progress.stored_strategy,
+                )
+                print(
+                    colored(
+                        "♻️  复用进度中的 auto 策略（跳过预读）",
+                        "cyan",
+                    )
+                )
+            else:
+                sample_idx = pick_preflight_pages(total_pages)
+                samples = collect_preflight_samples(pdf_document, sample_idx)
+                assessment = run_preflight_assessment(
+                    client,
+                    samples,
+                    total_pages=total_pages,
+                    has_toc=bool(toc),
+                )
+                strategy = strategy_from_assessment(
+                    assessment, total_pages=total_pages
+                )
+                strategy = resolve_strategy(
+                    "auto",
+                    total_pages=total_pages,
+                    knowledge_chars=kb_chars,
+                    prebuilt=strategy,
+                )
         else:
             strategy = resolve_strategy(
-                config.profile_name, total_pages=total_pages
+                config.profile_name,
+                total_pages=total_pages,
+                knowledge_chars=kb_chars,
             )
+        active_strategy = strategy
         print(colored(f"⚙️  生效策略：{strategy.label()}", "cyan"))
         print(colored(f"   {strategy.description}", "cyan"))
+
+        # 尽早写入指纹与 strategy_spec，便于中断后续跑
+        save_knowledge_state(
+            config, state, strategy, pdf_page_count=total_pages
+        )
 
         try:
             if not extract_done:
@@ -1748,13 +2115,14 @@ PDF：    {config.pdf_source}
             print(format_skip_meta(state))
 
             gold_notes = load_gold_notes(config.gold_path)
-            summary = generate_summary(
+            summary, strategy = generate_summary(
                 client,
                 state.knowledge,
                 strategy,
                 gold_notes=gold_notes,
                 toc=toc,
             )
+            active_strategy = strategy
             save_summary(config, summary, state, strategy)
 
         except (APIStatusError, APIError, APIConnectionError, APITimeoutError) as exc:
@@ -1775,6 +2143,20 @@ PDF：    {config.pdf_source}
         print(colored("\n✨ 处理完成 ✨", "green", attrs=["bold"]))
 
     except KeyboardInterrupt:
+        if (
+            state is not None
+            and config is not None
+            and active_strategy is not None
+        ):
+            try:
+                save_knowledge_state(
+                    config,
+                    state,
+                    active_strategy,
+                    pdf_page_count=total_pages_for_save,
+                )
+            except Exception:
+                pass
         _graceful_interrupt(config, state, phase="用户 Ctrl+C")
     finally:
         if pdf_document is not None:

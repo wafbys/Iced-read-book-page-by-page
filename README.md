@@ -4,26 +4,52 @@
 
 基于 [echohive42/AI-reads-books-page-by-page](https://github.com/echohive42/AI-reads-books-page-by-page) 改造。
 
+**要求**：Python 3.10+
+
 ## 怎么用
 
 ```bash
 pip install -r requirements.txt
-$env:DEEPSEEK_API_KEY = "sk-..."
+```
 
+设置 API Key（任选其一）：
+
+```bash
+# Linux / macOS (bash / zsh) — 当前会话
+export DEEPSEEK_API_KEY="sk-..."
+```
+
+```powershell
+# Windows PowerShell — 当前会话
+$env:DEEPSEEK_API_KEY = "sk-..."
+```
+
+```cmd
+:: Windows CMD — 当前会话
+set DEEPSEEK_API_KEY=sk-...
+```
+
+也可在项目根目录放置 `.env`（参考 `.env.example`）。程序启动时会**可选加载** `.env`，**不覆盖**已存在的环境变量。
+
+```bash
 # 默认 auto（预读评估）
 python read_books.py your_book.pdf
 
-# 固定档（命令行参数）
+# 固定档
 python read_books.py your_book.pdf --profile economy
 python read_books.py your_book.pdf --profile balanced
 python read_books.py your_book.pdf --profile quality
 python read_books.py your_book.pdf -p auto
+
+# 指定产出目录（默认 ./book_analysis，相对当前工作目录）
+python read_books.py your_book.pdf --out-dir ./my_out
 ```
 
 | 参数 | 说明 |
 |------|------|
 | `pdf` | PDF 路径或文件名（必填） |
 | `--profile` / `-p` | `auto` \| `economy` \| `balanced` \| `quality`（默认 `auto`） |
+| `--out-dir` | 产出目录（默认 `book_analysis`，相对 **当前工作目录**） |
 
 未传 `--profile` 时，可读环境变量 `READ_BOOKS_PROFILE` 作为后备。
 
@@ -31,8 +57,8 @@ python read_books.py your_book.pdf -p auto
 
 | 档位 | 行为 |
 |------|------|
-| **auto**（默认） | 预读约 5 页 → 评估难度 → 动态选抽页/总结强度 |
-| **economy** | 固定：全 Flash，无审校 |
+| **auto**（默认） | 预读约 5 页 → 评估难度 → 动态选抽页/总结强度；决议写入进度，续跑复用 |
+| **economy** | 固定：全 Flash，无审校，**总结关闭 thinking** |
 | **balanced** | 固定：Flash 抽 + Pro 结/审 high；页码稀可升 max 再审 |
 | **quality** | 固定：Pro 抽+thinking；结/审 max |
 
@@ -43,30 +69,76 @@ python read_books.py your_book.pdf -p auto
 ## 产出
 
 ```
-book_analysis/
+book_analysis/              # 或 --out-dir 指定的目录
   书名.pdf
-  书名_knowledge.json
+  书名_knowledge.json       # 含 next_page、PDF 指纹、strategy_spec
   书名.md
-  书名_gold.md             # 可选人工金标准
+  书名_gold.md              # 可选人工金标准
 ```
+
+## 工作目录与进度文件
+
+- 产出目录默认是 **进程当前工作目录** 下的 `book_analysis/`，不是脚本所在目录。换目录执行同一命令会写成另一套进度。
+- 进度按 **PDF 文件名**（stem）区分：`书名_knowledge.json`。同名不同内容会通过 **SHA-256 指纹** 检测；不一致时拒绝续跑，需删 JSON 或换回原 PDF。
+- `auto` 首次评估后的完整策略会写入 `meta.strategy_spec`；中途 Ctrl+C 后续跑会 **复用** 该策略，不再重新预读（除非删进度或改用其它 `--profile`）。
 
 ## 重复执行
 
 | 状态 | 行为 |
 |------|------|
-| 未抽完 | 从 `next_page` 续跑 |
+| 未抽完 | 从 `next_page` 续跑（`auto` 复用已存策略） |
 | 抽完 + 已有 md | **跳过** |
-| 抽完 + 无 md | 只跑总结 |
+| 抽完 + 无 md | 只跑总结（`auto` 复用已存策略） |
 | 重写总结 | 删 `书名.md` 再执行（可换 `--profile`） |
 | 重抽全书 | 删 `书名_knowledge.json` |
 | 人工迭代 | 润色稿另存 `书名_gold.md`，删 md 再跑 |
 
 ## API Key
 
-仅环境变量 `DEEPSEEK_API_KEY`。
+使用环境变量 `DEEPSEEK_API_KEY`（不要把真实 Key 提交进仓库）。
+
+**当前会话**
+
+| 系统 | 命令 |
+|------|------|
+| Linux / macOS | `export DEEPSEEK_API_KEY="sk-..."` |
+| Windows PowerShell | `$env:DEEPSEEK_API_KEY = "sk-..."` |
+| Windows CMD | `set DEEPSEEK_API_KEY=sk-...` |
+
+**永久（用户级）**
+
+```bash
+# Linux / macOS — 写入 shell 配置后重开终端
+echo 'export DEEPSEEK_API_KEY="sk-..."' >> ~/.bashrc   # bash
+echo 'export DEEPSEEK_API_KEY="sk-..."' >> ~/.zshrc    # zsh
+```
 
 ```powershell
-$env:DEEPSEEK_API_KEY = "sk-..."
+# Windows PowerShell（用户级，新开终端生效）
+[System.Environment]::SetEnvironmentVariable("DEEPSEEK_API_KEY", "sk-...", "User")
+```
+
+```cmd
+:: Windows CMD（用户级，新开终端生效）
+setx DEEPSEEK_API_KEY "sk-..."
+```
+
+**可选 `.env`**（项目根目录，已被 `.gitignore` 忽略）：
+
+```bash
+DEEPSEEK_API_KEY=sk-...
+# READ_BOOKS_PROFILE=auto
+```
+
+## 平台支持
+
+Windows / Linux / macOS 通用。依赖与路径 API 跨平台；注意 shell 设置环境变量的语法不同，以及产出目录相对 **CWD**。
+
+## 测试
+
+```bash
+pip install -r requirements.txt
+python -m pytest -q
 ```
 
 ## License
