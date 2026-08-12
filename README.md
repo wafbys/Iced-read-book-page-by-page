@@ -46,6 +46,9 @@ python read_books.py your_book.pdf --out-dir ./my_out
 
 # 危险操作确认（无指纹旧进度覆盖 PDF / 中途切换抽取模型）
 python read_books.py your_book.pdf --force
+
+# auto 跳过交互确认，直接采用预读映射（脚本/CI）
+python read_books.py your_book.pdf -y
 ```
 
 | 参数 | 说明 |
@@ -54,6 +57,7 @@ python read_books.py your_book.pdf --force
 | `--profile` / `-p` | `auto` \| `economy` \| `balanced` \| `quality`（默认 `auto`） |
 | `--out-dir` | 产出目录（默认 `book_analysis`，相对 **当前工作目录**） |
 | `--force` | 允许无指纹时覆盖 PDF 副本；抽取未完成时切换不一致的抽取模型 |
+| `--yes` / `-y` | auto 模式跳过确认，直接采用预读映射策略 |
 
 未传 `--profile` 时，可读环境变量 `READ_BOOKS_PROFILE` 作为后备。
 
@@ -61,7 +65,7 @@ python read_books.py your_book.pdf --force
 
 | 档位 | 行为 |
 |------|------|
-| **auto**（默认） | 预读约 5 页 → 评估 → **确定性映射 + 成本硬闸** → 写入进度；续跑复用 |
+| **auto**（默认） | 预读 → 展示分析 → **确认或改选档位** → 写入采样文件；续跑不再询问 |
 | **economy** | 固定：全 Flash，无审校，**总结关闭 thinking** |
 | **balanced** | 固定：Flash 抽 + Pro 结/审 high；页码稀可升 max 再审 |
 | **quality** | 固定：Pro 抽+thinking；结/审 max |
@@ -69,10 +73,10 @@ python read_books.py your_book.pdf --force
 **auto 机制（简）**：
 
 1. 抽样页（约 5%/20%/40%/65%/85%）→ Flash 预读打分  
-2. 代码映射为流水线（非模型直接选模型 ID）  
-3. **硬闸**：`difficulty≤2` 禁止 Pro 抽页；抽页 thinking **仅** `difficulty≥5` 且 Pro  
-4. **信号入规则**：`text_noise≥4` 强制审校（≥5 还升 max effort）；`term_density≥5` 且 diff≥3 可升 Pro 抽；`term_density≥4` 且 diff≥3 升 summary max  
-5. 日志打印「评估原值 / 映射调整 / 生效策略」；`meta.preflight_assessment` 与 `mapping_overrides` 写入 knowledge  
+2. 代码映射为流水线（成本硬闸 + noise/terms 规则）  
+3. **展示分析报告**，请你确认或改选 `economy` / `balanced` / `quality`  
+4. 决议写入 **`书名_preflight.json`（采样文件）**；再次运行直接复用，**不再询问**  
+5. **删除采样文件** → 重新预读并再次确认；脚本可用 `-y` 跳过确认  
 
 **其它自动微调**：分块随页数/知识量变化；审校后页码过稀时可再 max 审一轮。
 ## 产出
@@ -81,6 +85,7 @@ python read_books.py your_book.pdf --force
 book_analysis/              # 或 --out-dir 指定的目录
   书名.pdf
   书名_knowledge.json       # 含 next_page、PDF 指纹、strategy_spec
+  书名_preflight.json       # auto 采样决议（删此文件可重新预读/选档）
   书名.md
   书名_gold.md              # 可选人工金标准
 ```
@@ -90,7 +95,8 @@ book_analysis/              # 或 --out-dir 指定的目录
 - 产出目录默认是 **进程当前工作目录** 下的 `book_analysis/`，不是脚本所在目录。换目录执行同一命令会写成另一套进度。
 - 进度按 **PDF 文件名**（stem）区分：`书名_knowledge.json`。同名不同内容会通过 **SHA-256 指纹** 检测；不一致时拒绝续跑，需删 JSON 或换回原 PDF。
 - 旧进度若 **缺少指纹** 且已有实质抽取内容：须加 `--force` 确认当前 PDF 后继续（随后会补写指纹）。无指纹时也不会静默用不同源文件覆盖副本。
-- `auto` 预读后的完整策略写入 `meta.strategy_spec` 后，续跑（含首页 API 中断、`next_page==0`）会 **复用**，不再重新预读（删进度或改用其它 `--profile` 除外）。
+- auto 的用户决议在 **`书名_preflight.json`**：有则跳过预读与确认；**删除该文件**才会重新分析并再次选择。  
+- knowledge 里仍有 `strategy_spec`；若仅有旧进度、尚无采样文件，会静默生成采样文件以免打断续跑。  
 - 抽取未完成时切换会改变抽页模型的 `--profile`：默认拒绝，避免一本 knowledge 混档；确认后可加 `--force`。
 - 长书审校时若知识点过长需抽样，审校改为 **只补页码、禁止按残缺知识删初稿**。
 

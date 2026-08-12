@@ -20,12 +20,16 @@ from read_books import (
     empty_state,
     file_sha256,
     load_dotenv_if_present,
+    load_preflight_decision,
     pages_complete,
     parse_args,
+    parse_confirm_choice,
     pick_preflight_pages,
     resolve_strategy,
+    save_preflight_decision,
     setup_directories,
     strategy_from_assessment,
+    validate_preflight_decision,
     validate_progress,
     _base_profiles,
     _tune_chunk_size,
@@ -346,6 +350,59 @@ def test_parse_args_force(tmp_path: Path):
     assert cfg.force is True
     cfg2 = parse_args(["a.pdf", "--out-dir", str(tmp_path)])
     assert cfg2.force is False
+
+
+def test_parse_args_yes_and_preflight_path(tmp_path: Path):
+    cfg = parse_args(["demo.pdf", "-y", "--out-dir", str(tmp_path)])
+    assert cfg.yes is True
+    assert cfg.preflight_path == tmp_path / "demo_preflight.json"
+
+
+def test_parse_confirm_choice():
+    assert parse_confirm_choice("") == "auto"
+    assert parse_confirm_choice("yes") == "auto"
+    assert parse_confirm_choice("1") == "economy"
+    assert parse_confirm_choice("2") == "balanced"
+    assert parse_confirm_choice("3") == "quality"
+    assert parse_confirm_choice("0") == "quit"
+    assert parse_confirm_choice("q") == "quit"
+    assert parse_confirm_choice("nope") is None
+
+
+def test_preflight_decision_roundtrip(tmp_path: Path):
+    path = tmp_path / "book_preflight.json"
+    s = _base_profiles()["balanced"]
+    a = _assessment(difficulty=3, rationale="rt")
+    save_preflight_decision(
+        path,
+        pdf_name="book.pdf",
+        pdf_sha256="abc123",
+        total_pages=50,
+        sample_pages=[3, 10, 20],
+        assessment=a,
+        mapping_overrides=["demo override"],
+        proposed_label="proposed",
+        chosen_profile="balanced",
+        strategy=s,
+        confirmed_via="interactive",
+    )
+    data = load_preflight_decision(path)
+    assert data is not None
+    assert data["chosen_profile"] == "balanced"
+    assert data["sample_pages"] == [3, 10, 20]
+    restored = validate_preflight_decision(
+        data, pdf_sha256="abc123", total_pages=50
+    )
+    assert restored is not None
+    assert restored.extract_model == s.extract_model
+    assert (
+        validate_preflight_decision(data, pdf_sha256="other", total_pages=50)
+        is None
+    )
+    assert (
+        validate_preflight_decision(data, pdf_sha256="abc123", total_pages=99)
+        is None
+    )
 
 
 def test_load_dotenv_if_present(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

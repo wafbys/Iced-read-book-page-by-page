@@ -5,15 +5,17 @@ PDF 书籍分析器 — 逐页提取知识点，生成一篇带页码的总结�
   python read_books.py book.pdf
   python read_books.py book.pdf --profile auto|economy|balanced|quality
   python read_books.py book.pdf --out-dir ./out
+  python read_books.py book.pdf -y          # 跳过 auto 交互确认
 
-  auto     — 预读评估后动态选 Flash/Pro、high/max（默认；策略写入进度）
+  auto     — 预读评估 → 展示结果 → 确认或改选档位（默认）
   economy  — 固定省钱：全 Flash，无审校，总结关 thinking
   balanced — 固定平衡：Flash 抽 + Pro 结/审 high
   quality  — 固定最强：Pro 抽+thinking；结/审 max
 
 未传 --profile 时可读环境变量 READ_BOOKS_PROFILE。
+auto 决议写入 <stem>_preflight.json；再次运行跳过确认，删该文件可重新预读/选择。
 也可选加载项目根目录 .env（不覆盖已有环境变量）。
-产出：<out-dir>/<书名>.pdf | _knowledge.json | .md（默认 out-dir=book_analysis）
+产出：<out-dir>/<书名>.pdf | _knowledge.json | _preflight.json | .md
 Ctrl+C 可中断并保留进度。API Key：DEEPSEEK_API_KEY。
 """
 
@@ -69,12 +71,15 @@ PREFLIGHT_SAMPLE_TARGET = 5
 PREFLIGHT_CHARS_PER_PAGE = 2_500
 DEFAULT_OUT_DIR = "book_analysis"
 HASH_CHUNK_SIZE = 1024 * 1024
+PREFLIGHT_DECISION_VERSION = 1
 
 EXTRA_BODY_NO_THINKING = {"thinking": {"type": "disabled"}}
 EXTRA_BODY_THINKING = {"thinking": {"type": "enabled"}}
 
 PROFILE_ENV = "READ_BOOKS_PROFILE"
 VALID_PROFILES = ("auto", "economy", "balanced", "quality")
+# 交互确认时可改选的固定档（不含 auto 本身；Enter 表示采用 auto 映射）
+CONFIRM_PROFILE_CHOICES = ("economy", "balanced", "quality")
 
 
 @dataclass(frozen=True)
@@ -453,6 +458,278 @@ def log_assessment_mapping(
     )
 
 
+def print_auto_analysis_report(
+    *,
+    total_pages: int,
+    sample_pages: list[int],
+    assessment: PreflightAssessment,
+    proposed: PipelineStrategy,
+    overrides: list[str],
+    has_toc: bool,
+) -> None:
+    """向用户展示 auto 预读分析结论（确认前）。"""
+    print(colored("\n" + "═" * 56, "cyan"))
+    print(colored("📊 auto 预读分析报告", "cyan", attrs=["bold"]))
+    print(colored("═" * 56, "cyan"))
+    print(colored(f"  全书页数：{total_pages}　书签：{'有' if has_toc else '无'}", "cyan"))
+    pages_s = ", ".join(str(p) for p in sample_pages) if sample_pages else "（无实质正文样本）"
+    print(colored(f"  抽样页码：{pages_s}", "cyan"))
+    print(
+        colored(
+            f"  难度={assessment.difficulty}/5  "
+            f"噪声={assessment.text_noise}/5  "
+            f"术语={assessment.term_density}/5  "
+            f"结构={assessment.structure_complexity}/5",
+            "cyan",
+        )
+    )
+    print(
+        colored(
+            f"  模型建议：Pro抽={assessment.need_pro_extract}  "
+            f"抽thinking={assessment.need_extract_thinking}  "
+            f"总结={assessment.summary_effort}  "
+            f"审校={assessment.review_effort}  "
+            f"做审校={assessment.do_review}",
+            "cyan",
+        )
+    )
+    if (assessment.rationale or "").strip():
+        print(colored(f"  理由：{assessment.rationale.strip()}", "cyan"))
+    if overrides:
+        print(colored("  映射硬闸/调整：", "yellow"))
+        for line in overrides:
+            print(colored(f"    · {line}", "yellow"))
+    else:
+        print(colored("  映射硬闸/调整：无", "cyan"))
+    print(colored(f"  建议策略：{proposed.label()}", "green", attrs=["bold"]))
+    print(colored(f"  说明：{proposed.description}", "green"))
+    print(colored("═" * 56, "cyan"))
+
+
+def parse_confirm_choice(raw: str) -> str | None:
+    """
+    解析用户确认输入。
+    返回：'auto' | 'economy' | 'balanced' | 'quality' | 'quit'；无效则 None。
+    """
+    s = (raw or "").strip().lower()
+    if s in ("", "a", "auto", "y", "yes", "是", "确认"):
+        return "auto"
+    if s in ("1", "e", "economy", "省钱"):
+        return "economy"
+    if s in ("2", "b", "balanced", "平衡"):
+        return "balanced"
+    if s in ("3", "quality", "最强"):
+        return "quality"
+    if s in ("0", "q", "quit", "exit", "n", "no", "取消"):
+        return "quit"
+    if s in CONFIRM_PROFILE_CHOICES:
+        return s
+    return None
+
+
+def confirm_auto_strategy_interactive(
+    *,
+    proposed: PipelineStrategy,
+    yes: bool,
+) -> str:
+    """
+    让用户确认 auto 建议或改选固定档。
+    返回 chosen_profile：'auto' | 'economy' | 'balanced' | 'quality'。
+    用户退出时 SystemExit(0)。
+    """
+    if yes:
+        print(
+            colored(
+                "✓ 已指定 --yes：采用 auto 映射策略，跳过确认。",
+                "green",
+            )
+        )
+        return "auto"
+
+    if not sys.stdin.isatty():
+        print(
+            colored(
+                "✓ 非交互终端：采用 auto 映射策略（可用 -y 明示；"
+                "要改档请用 --profile）。",
+                "yellow",
+            ),
+            file=sys.stderr,
+        )
+        return "auto"
+
+    print(
+        colored(
+            "\n请确认策略（决议将写入采样文件，再次运行不再询问；\n"
+            "删除 <书名>_preflight.json 可重新预读与选择）：\n"
+            "  [Enter]  采用上方 auto 建议\n"
+            "  [1]      economy  省钱（全 Flash，无审校）\n"
+            "  [2]      balanced 平衡（Flash 抽 + Pro 结/审）\n"
+            "  [3]      quality  最强（Pro 抽+thinking）\n"
+            "  [0]      退出，不开始处理",
+            "cyan",
+        )
+    )
+    while True:
+        try:
+            raw = input(colored("你的选择 > ", "cyan"))
+        except EOFError:
+            print(
+                colored("未读到输入，采用 auto 映射策略。", "yellow"),
+                file=sys.stderr,
+            )
+            return "auto"
+        choice = parse_confirm_choice(raw)
+        if choice == "quit":
+            print(colored("已取消。", "yellow"))
+            raise SystemExit(0)
+        if choice in ("auto",) + CONFIRM_PROFILE_CHOICES:
+            if choice == "auto":
+                print(colored(f"✓ 采用 auto 建议：{proposed.label()}", "green"))
+            else:
+                print(colored(f"✓ 改选固定档：{choice}", "green"))
+            return choice
+        print(
+            colored(
+                "无效输入。请 Enter / 1 / 2 / 3 / 0。",
+                "yellow",
+            ),
+            file=sys.stderr,
+        )
+
+
+def load_preflight_decision(path: Path) -> dict | None:
+    if not path.is_file():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(
+            colored(
+                f"⚠️  无法读取采样文件 {path}：{exc}（将重新预读）",
+                "yellow",
+            ),
+            file=sys.stderr,
+        )
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def validate_preflight_decision(
+    data: dict,
+    *,
+    pdf_sha256: str,
+    total_pages: int,
+) -> PipelineStrategy | None:
+    """校验采样决议与当前 PDF 一致，并恢复 strategy。"""
+    stored_sha = data.get("pdf_sha256")
+    if stored_sha and stored_sha != pdf_sha256:
+        print(
+            colored(
+                "⚠️  采样文件中的 PDF 指纹与当前文件不一致，将重新预读。",
+                "yellow",
+            ),
+            file=sys.stderr,
+        )
+        return None
+    stored_pages = data.get("pdf_page_count")
+    if stored_pages is not None:
+        try:
+            if int(stored_pages) != total_pages:
+                print(
+                    colored(
+                        "⚠️  采样文件页数与当前 PDF 不一致，将重新预读。",
+                        "yellow",
+                    ),
+                    file=sys.stderr,
+                )
+                return None
+        except (TypeError, ValueError):
+            return None
+    spec = data.get("strategy_spec")
+    strategy = PipelineStrategy.from_spec(spec) if isinstance(spec, dict) else None
+    if strategy is None:
+        print(
+            colored(
+                "⚠️  采样文件缺少有效 strategy_spec，将重新预读。",
+                "yellow",
+            ),
+            file=sys.stderr,
+        )
+        return None
+    return strategy
+
+
+def save_preflight_decision(
+    path: Path,
+    *,
+    pdf_name: str,
+    pdf_sha256: str,
+    total_pages: int,
+    sample_pages: list[int],
+    assessment: PreflightAssessment | dict | None,
+    mapping_overrides: list[str],
+    proposed_label: str,
+    chosen_profile: str,
+    strategy: PipelineStrategy,
+    confirmed_via: str,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if isinstance(assessment, PreflightAssessment):
+        assessment_blob: dict | None = assessment.model_dump()
+    elif isinstance(assessment, dict):
+        assessment_blob = assessment
+    else:
+        assessment_blob = None
+    payload = {
+        "version": PREFLIGHT_DECISION_VERSION,
+        "pdf_name": pdf_name,
+        "pdf_sha256": pdf_sha256,
+        "pdf_page_count": total_pages,
+        "sample_pages": list(sample_pages),
+        "assessment": assessment_blob,
+        "mapping_overrides": list(mapping_overrides),
+        "proposed_strategy_label": proposed_label,
+        "chosen_profile": chosen_profile,
+        "strategy_spec": strategy.to_spec(),
+        "strategy_label": strategy.label(),
+        "confirmed_at": datetime.now().isoformat(timespec="seconds"),
+        "confirmed_via": confirmed_via,
+    }
+    atomic_write_json(path, payload)
+    print(colored(f"💾 已写入采样决议：{path}", "blue"))
+
+
+def migrate_legacy_strategy_to_preflight(
+    config: Config,
+    strategy: PipelineStrategy,
+    *,
+    pdf_sha256: str,
+    total_pages: int,
+    meta: dict,
+) -> None:
+    """旧进度仅有 strategy_spec、无采样文件时，静默生成决议文件避免再打断。"""
+    assessment = meta.get("preflight_assessment")
+    overrides = meta.get("mapping_overrides") or []
+    if not isinstance(overrides, list):
+        overrides = []
+    save_preflight_decision(
+        config.preflight_path,
+        pdf_name=config.pdf_name,
+        pdf_sha256=pdf_sha256,
+        total_pages=total_pages,
+        sample_pages=[],
+        assessment=assessment if isinstance(assessment, dict) else None,
+        mapping_overrides=[str(x) for x in overrides],
+        proposed_label=str(meta.get("strategy") or strategy.label()),
+        chosen_profile=str(meta.get("profile") or strategy.name or "auto"),
+        strategy=strategy,
+        confirmed_via="legacy_migrate",
+    )
+
+
 def resolve_strategy(
     profile_name: str | None = None,
     *,
@@ -685,9 +962,11 @@ class Config:
     knowledge_path: Path
     summary_path: Path
     gold_path: Path
+    preflight_path: Path
     profile_name: str
     out_dir: Path
     force: bool = False
+    yes: bool = False  # 跳过 auto 交互确认，直接采用映射策略
 
 
 @dataclass
@@ -897,6 +1176,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
             "  quality   固定最强：Pro 抽+thinking；结/审 max\n"
             f"未指定 --profile 时可读环境变量 {PROFILE_ENV}。\n"
             "输出目录默认 ./book_analysis（相对当前工作目录）；可用 --out-dir 指定。\n"
+            "auto 预读后会提示确认；决议写入 <书名>_preflight.json，"
+            "删该文件可重新预读与选择。\n"
         ),
     )
     parser.add_argument("pdf", help="PDF 路径或文件名")
@@ -920,6 +1201,12 @@ def parse_args(argv: list[str] | None = None) -> Config:
             "允许：无指纹进度时覆盖 PDF 副本；"
             "抽取未完成时切换与进度不一致的抽取模型"
         ),
+    )
+    parser.add_argument(
+        "--yes",
+        "-y",
+        action="store_true",
+        help="auto 模式下跳过交互确认，直接采用预读映射策略",
     )
     args = parser.parse_args(argv)
 
@@ -952,9 +1239,11 @@ def parse_args(argv: list[str] | None = None) -> Config:
         knowledge_path=out_dir / f"{stem}_knowledge.json",
         summary_path=out_dir / f"{stem}.md",
         gold_path=out_dir / f"{stem}_gold.md",
+        preflight_path=out_dir / f"{stem}_preflight.json",
         profile_name=profile,
         out_dir=out_dir,
         force=bool(args.force),
+        yes=bool(args.yes),
     )
 
 
@@ -2146,10 +2435,11 @@ PDF：    {config.pdf_source}
 档位：   {config.profile_name}
 产出目录：{config.out_dir}
 进度：   {config.knowledge_path}
+采样决议：{config.preflight_path}
 总结：   {config.summary_path}
 金标准： {config.gold_path}（可选）
 切换：   --profile auto|economy|balanced|quality
-提示：   Ctrl+C 可中断，已处理页进度会保留
+提示：   Ctrl+C 可中断；auto 决议见采样文件，删之可重选
 """,
                 "cyan",
             )
@@ -2195,6 +2485,8 @@ PDF：    {config.pdf_source}
                     f"   重写总结 → 删除该 md 后再执行\n"
                     f"   人工润色 → 另存为 {config.gold_path.name} 供下次总结参考\n"
                     f"   重抽全书 → 删除 knowledge JSON 后再执行\n"
+                    f"   重做 auto 预读/改选 → 删除采样文件：\n"
+                    f"   {config.preflight_path}\n"
                     f"   换策略 → --profile … 后重跑"
                     f"（总结立即生效；抽取模型变化须重抽）",
                     "green",
@@ -2205,49 +2497,126 @@ PDF：    {config.pdf_source}
 
         client = create_client()
 
-        # —— 策略：auto 优先复用进度中的决议；固定档按请求解析 ——
+        # —— 策略：auto 读采样决议 / 预读确认；固定档直接解析 ——
         profile = config.profile_name.strip().lower()
         kb_chars = sum(len(i.text) for i in state.knowledge) or None
         fresh_assessment: PreflightAssessment | None = None
         fresh_overrides: list[str] = []
+        pdf_sha = file_sha256(config.pdf_path)
+
         if profile == "auto":
-            # 有合法 auto strategy_spec 即复用（含 next_page==0 首页中断后续跑）
-            can_reuse = (
-                progress.stored_strategy is not None
-                and progress.stored_strategy.name == "auto"
-            )
-            if can_reuse:
+            strategy = None
+            decision = load_preflight_decision(config.preflight_path)
+            if decision is not None:
+                restored = validate_preflight_decision(
+                    decision,
+                    pdf_sha256=pdf_sha,
+                    total_pages=total_pages,
+                )
+                if restored is not None:
+                    strategy = resolve_strategy(
+                        restored.name if restored.name in VALID_PROFILES else "auto",
+                        total_pages=total_pages,
+                        knowledge_chars=kb_chars,
+                        prebuilt=restored,
+                    )
+                    chosen = decision.get("chosen_profile") or restored.name
+                    print(
+                        colored(
+                            f"♻️  复用采样决议（{config.preflight_path.name}）\n"
+                            f"   当时选择：{chosen}\n"
+                            f"   策略：{strategy.label()}\n"
+                            f"   重新预读/改选：删除该采样文件后再运行",
+                            "cyan",
+                        )
+                    )
+
+            # 无采样文件：旧 knowledge 已有策略 → 静默迁移，避免打断续跑
+            if strategy is None and progress.stored_strategy is not None:
                 strategy = resolve_strategy(
-                    "auto",
+                    progress.stored_strategy.name
+                    if progress.stored_strategy.name in VALID_PROFILES
+                    else "auto",
                     total_pages=total_pages,
                     knowledge_chars=kb_chars,
                     prebuilt=progress.stored_strategy,
                 )
+                migrate_legacy_strategy_to_preflight(
+                    config,
+                    strategy,
+                    pdf_sha256=pdf_sha,
+                    total_pages=total_pages,
+                    meta=progress.meta,
+                )
                 print(
                     colored(
-                        "♻️  复用进度中的 auto 策略（跳过预读）",
+                        "♻️  由进度中的策略生成采样文件（跳过确认）\n"
+                        f"   策略：{strategy.label()}",
                         "cyan",
                     )
                 )
-            else:
+
+            if strategy is None:
                 sample_idx = pick_preflight_pages(total_pages)
                 samples = collect_preflight_samples(pdf_document, sample_idx)
+                sample_pages_1b = [p for p, _ in samples]
                 assessment = run_preflight_assessment(
                     client,
                     samples,
                     total_pages=total_pages,
                     has_toc=bool(toc),
                 )
-                strategy, map_overrides = strategy_from_assessment(
+                proposed, map_overrides = strategy_from_assessment(
                     assessment, total_pages=total_pages
                 )
-                strategy = resolve_strategy(
+                proposed = resolve_strategy(
                     "auto",
                     total_pages=total_pages,
                     knowledge_chars=kb_chars,
-                    prebuilt=strategy,
+                    prebuilt=proposed,
                 )
-                log_assessment_mapping(assessment, strategy, map_overrides)
+                print_auto_analysis_report(
+                    total_pages=total_pages,
+                    sample_pages=sample_pages_1b,
+                    assessment=assessment,
+                    proposed=proposed,
+                    overrides=map_overrides,
+                    has_toc=bool(toc),
+                )
+                log_assessment_mapping(assessment, proposed, map_overrides)
+
+                chosen_profile = confirm_auto_strategy_interactive(
+                    proposed=proposed,
+                    yes=config.yes,
+                )
+                if chosen_profile == "auto":
+                    strategy = proposed
+                    confirmed_via = (
+                        "yes_flag"
+                        if config.yes
+                        else ("non_tty" if not sys.stdin.isatty() else "interactive")
+                    )
+                else:
+                    strategy = resolve_strategy(
+                        chosen_profile,
+                        total_pages=total_pages,
+                        knowledge_chars=kb_chars,
+                    )
+                    confirmed_via = "interactive_override"
+
+                save_preflight_decision(
+                    config.preflight_path,
+                    pdf_name=config.pdf_name,
+                    pdf_sha256=pdf_sha,
+                    total_pages=total_pages,
+                    sample_pages=sample_pages_1b,
+                    assessment=assessment,
+                    mapping_overrides=map_overrides,
+                    proposed_label=proposed.label(),
+                    chosen_profile=chosen_profile,
+                    strategy=strategy,
+                    confirmed_via=confirmed_via,
+                )
                 fresh_assessment = assessment
                 fresh_overrides = map_overrides
         else:
