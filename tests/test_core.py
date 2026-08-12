@@ -21,17 +21,15 @@ from read_books import (
     empty_state,
     file_sha256,
     load_dotenv_if_present,
-    load_preflight_decision,
     normalize_knowledge_list,
     pages_complete,
     parse_args,
     parse_confirm_choice,
     pick_preflight_pages,
     resolve_strategy,
-    save_preflight_decision,
     setup_directories,
     strategy_from_assessment,
-    validate_preflight_decision,
+    try_import_legacy_preflight_file,
     validate_progress,
     _base_profiles,
     _tune_chunk_size,
@@ -369,10 +367,10 @@ def test_review_prompts_differ_on_deletion():
     assert "删除初稿" in REVIEW_SYSTEM_PROMPT or "删除" in REVIEW_SYSTEM_PROMPT
 
 
-def test_parse_args_yes_and_preflight_path(tmp_path: Path):
+def test_parse_args_yes(tmp_path: Path):
     cfg = parse_args(["demo.pdf", "-y", "--out-dir", str(tmp_path)])
     assert cfg.yes is True
-    assert cfg.preflight_path == tmp_path / "demo_preflight.json"
+    assert cfg.knowledge_path == tmp_path / "demo_knowledge.json"
 
 
 def test_parse_confirm_choice():
@@ -386,38 +384,46 @@ def test_parse_confirm_choice():
     assert parse_confirm_choice("nope") is None
 
 
-def test_preflight_decision_roundtrip(tmp_path: Path):
-    path = tmp_path / "book_preflight.json"
+def test_legacy_preflight_file_import(tmp_path: Path):
+    """旧版 _preflight.json 可被读入；指纹不符则忽略。"""
+    from read_books import Config, PipelineStrategy
+
     s = _base_profiles()["balanced"]
-    a = _assessment(difficulty=3, rationale="rt")
-    save_preflight_decision(
-        path,
+    out = tmp_path / "out"
+    out.mkdir()
+    legacy = out / "book_preflight.json"
+    legacy.write_text(
+        json.dumps(
+            {
+                "pdf_sha256": "abc123",
+                "pdf_page_count": 50,
+                "strategy_spec": s.to_spec(),
+                "chosen_profile": "balanced",
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = Config(
         pdf_name="book.pdf",
-        pdf_sha256="abc123",
-        total_pages=50,
-        sample_pages=[3, 10, 20],
-        assessment=a,
-        mapping_overrides=["demo override"],
-        proposed_label="proposed",
-        chosen_profile="balanced",
-        strategy=s,
-        confirmed_via="interactive",
+        pdf_source=tmp_path / "book.pdf",
+        pdf_path=out / "book.pdf",
+        knowledge_path=out / "book_knowledge.json",
+        summary_path=out / "book.md",
+        gold_path=out / "book_gold.md",
+        profile_name="auto",
+        out_dir=out,
     )
-    data = load_preflight_decision(path)
-    assert data is not None
+    got = try_import_legacy_preflight_file(
+        cfg, pdf_sha256="abc123", total_pages=50
+    )
+    assert got is not None
+    strategy, data = got
+    assert strategy.extract_model == s.extract_model
     assert data["chosen_profile"] == "balanced"
-    assert data["sample_pages"] == [3, 10, 20]
-    restored = validate_preflight_decision(
-        data, pdf_sha256="abc123", total_pages=50
-    )
-    assert restored is not None
-    assert restored.extract_model == s.extract_model
     assert (
-        validate_preflight_decision(data, pdf_sha256="other", total_pages=50)
-        is None
-    )
-    assert (
-        validate_preflight_decision(data, pdf_sha256="abc123", total_pages=99)
+        try_import_legacy_preflight_file(
+            cfg, pdf_sha256="other", total_pages=50
+        )
         is None
     )
 

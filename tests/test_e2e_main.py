@@ -108,19 +108,17 @@ def test_main_auto_yes_end_to_end(tmp_path: Path, api_key_env, monkeypatch: pyte
     preflight = out / "sample_book_preflight.json"
     assert knowledge.is_file()
     assert summary.is_file()
-    assert preflight.is_file()
+    assert not preflight.is_file()  # 策略已并入 knowledge，不再单独写
 
     data = json.loads(knowledge.read_text(encoding="utf-8"))
     assert data["next_page"] >= 2
     assert len(data.get("knowledge") or []) >= 1
-    assert "strategy_spec" in (data.get("meta") or {})
+    meta = data.get("meta") or {}
+    assert "strategy_spec" in meta
+    assert meta.get("chosen_profile") == "auto"
 
     md = summary.read_text(encoding="utf-8")
     assert "导读" in md or "REST" in md
-
-    decision = json.loads(preflight.read_text(encoding="utf-8"))
-    assert decision.get("chosen_profile") == "auto"
-    assert decision.get("strategy_spec")
 
 
 def test_main_second_run_skips_when_complete(

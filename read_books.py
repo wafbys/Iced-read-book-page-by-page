@@ -13,9 +13,9 @@ PDF 书籍分析器 — 逐页提取知识点，生成一篇带页码的总结�
   quality  — 固定最强：Pro 抽+thinking；结/审 max
 
 未传 --profile 时可读环境变量 READ_BOOKS_PROFILE。
-auto 决议写入 <stem>_preflight.json；再次运行跳过确认，删该文件可重新预读/选择。
+auto 决议写入 knowledge.json 的 meta（strategy_spec 等）；再次运行复用，删 knowledge 可重新预读/选档。
 也可选加载项目根目录 .env（不覆盖已有环境变量）。
-产出：<out-dir>/<书名>.pdf | _knowledge.json | _preflight.json | .md
+产出：<out-dir>/<书名>.pdf | _knowledge.json | .md
 Ctrl+C 可中断并保留进度。API Key：DEEPSEEK_API_KEY。
 """
 
@@ -561,8 +561,8 @@ def confirm_auto_strategy_interactive(
 
     print(
         colored(
-            "\n请确认策略（决议将写入采样文件，再次运行不再询问；\n"
-            "删除 <书名>_preflight.json 可重新预读与选择）：\n"
+            "\n请确认策略（写入 knowledge.json，再次运行不再询问；\n"
+            "重新预读/改选：删除 knowledge JSON 后重跑）：\n"
             "  [Enter]  采用上方 auto 建议\n"
             "  [1]      economy  省钱（全 Flash，无审校）\n"
             "  [2]      balanced 平衡（Flash 抽 + Pro 结/审）\n"
@@ -599,137 +599,47 @@ def confirm_auto_strategy_interactive(
         )
 
 
-def load_preflight_decision(path: Path) -> dict | None:
+def try_import_legacy_preflight_file(
+    config: Config,
+    *,
+    pdf_sha256: str,
+    total_pages: int,
+) -> tuple[PipelineStrategy, dict] | None:
+    """
+    兼容旧版独立的 <stem>_preflight.json：若 knowledge 尚无策略则读入一次。
+    之后策略只写在 knowledge.meta 里，不再维护该文件。
+    """
+    path = config.out_dir / f"{Path(config.pdf_name).stem}_preflight.json"
     if not path.is_file():
         return None
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-    except (OSError, json.JSONDecodeError) as exc:
-        print(
-            colored(
-                f"⚠️  无法读取采样文件 {path}：{exc}（将重新预读）",
-                "yellow",
-            ),
-            file=sys.stderr,
-        )
+    except (OSError, json.JSONDecodeError):
         return None
     if not isinstance(data, dict):
         return None
-    return data
-
-
-def validate_preflight_decision(
-    data: dict,
-    *,
-    pdf_sha256: str,
-    total_pages: int,
-) -> PipelineStrategy | None:
-    """校验采样决议与当前 PDF 一致，并恢复 strategy。"""
     stored_sha = data.get("pdf_sha256")
     if stored_sha and stored_sha != pdf_sha256:
-        print(
-            colored(
-                "⚠️  采样文件中的 PDF 指纹与当前文件不一致，将重新预读。",
-                "yellow",
-            ),
-            file=sys.stderr,
-        )
         return None
     stored_pages = data.get("pdf_page_count")
     if stored_pages is not None:
         try:
             if int(stored_pages) != total_pages:
-                print(
-                    colored(
-                        "⚠️  采样文件页数与当前 PDF 不一致，将重新预读。",
-                        "yellow",
-                    ),
-                    file=sys.stderr,
-                )
                 return None
         except (TypeError, ValueError):
             return None
-    spec = data.get("strategy_spec")
-    strategy = PipelineStrategy.from_spec(spec) if isinstance(spec, dict) else None
+    strategy = PipelineStrategy.from_spec(data.get("strategy_spec") or {})
     if strategy is None:
-        print(
-            colored(
-                "⚠️  采样文件缺少有效 strategy_spec，将重新预读。",
-                "yellow",
-            ),
-            file=sys.stderr,
-        )
         return None
-    return strategy
-
-
-def save_preflight_decision(
-    path: Path,
-    *,
-    pdf_name: str,
-    pdf_sha256: str,
-    total_pages: int,
-    sample_pages: list[int],
-    assessment: PreflightAssessment | dict | None,
-    mapping_overrides: list[str],
-    proposed_label: str,
-    chosen_profile: str,
-    strategy: PipelineStrategy,
-    confirmed_via: str,
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if isinstance(assessment, PreflightAssessment):
-        assessment_blob: dict | None = assessment.model_dump()
-    elif isinstance(assessment, dict):
-        assessment_blob = assessment
-    else:
-        assessment_blob = None
-    payload = {
-        "version": PREFLIGHT_DECISION_VERSION,
-        "pdf_name": pdf_name,
-        "pdf_sha256": pdf_sha256,
-        "pdf_page_count": total_pages,
-        "sample_pages": list(sample_pages),
-        "assessment": assessment_blob,
-        "mapping_overrides": list(mapping_overrides),
-        "proposed_strategy_label": proposed_label,
-        "chosen_profile": chosen_profile,
-        "strategy_spec": strategy.to_spec(),
-        "strategy_label": strategy.label(),
-        "confirmed_at": datetime.now().isoformat(timespec="seconds"),
-        "confirmed_via": confirmed_via,
-    }
-    atomic_write_json(path, payload)
-    print(colored(f"💾 已写入采样决议：{path}", "blue"))
-
-
-def migrate_legacy_strategy_to_preflight(
-    config: Config,
-    strategy: PipelineStrategy,
-    *,
-    pdf_sha256: str,
-    total_pages: int,
-    meta: dict,
-) -> None:
-    """旧进度仅有 strategy_spec、无采样文件时，静默生成决议文件避免再打断。"""
-    assessment = meta.get("preflight_assessment")
-    overrides = meta.get("mapping_overrides") or []
-    if not isinstance(overrides, list):
-        overrides = []
-    save_preflight_decision(
-        config.preflight_path,
-        pdf_name=config.pdf_name,
-        pdf_sha256=pdf_sha256,
-        total_pages=total_pages,
-        sample_pages=[],
-        assessment=assessment if isinstance(assessment, dict) else None,
-        mapping_overrides=[str(x) for x in overrides],
-        proposed_label=str(meta.get("strategy") or strategy.label()),
-        chosen_profile=str(meta.get("profile") or strategy.name or "auto"),
-        strategy=strategy,
-        confirmed_via="legacy_migrate",
+    print(
+        colored(
+            f"♻️  从旧版采样文件迁入策略：{path.name}（可删除该文件）\n"
+            f"   策略：{strategy.label()}",
+            "cyan",
+        )
     )
+    return strategy, data
 
 
 def resolve_strategy(
@@ -964,7 +874,6 @@ class Config:
     knowledge_path: Path
     summary_path: Path
     gold_path: Path
-    preflight_path: Path
     profile_name: str
     out_dir: Path
     yes: bool = False  # 跳过 auto 交互确认，直接采用映射策略
@@ -1226,8 +1135,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
             "  quality   固定最强：Pro 抽+thinking；结/审 max\n"
             f"未指定 --profile 时可读环境变量 {PROFILE_ENV}。\n"
             "输出目录默认 ./book_analysis（相对当前工作目录）；可用 --out-dir 指定。\n"
-            "auto 预读后会提示确认；决议写入 <书名>_preflight.json，"
-            "删该文件可重新预读与选择。\n"
+            "auto 预读后会提示确认；决议写入 knowledge.json 的 meta，"
+            "删除 knowledge 可重新预读与选择。\n"
         ),
     )
     parser.add_argument("pdf", help="PDF 路径或文件名")
@@ -1281,7 +1190,6 @@ def parse_args(argv: list[str] | None = None) -> Config:
         knowledge_path=out_dir / f"{stem}_knowledge.json",
         summary_path=out_dir / f"{stem}.md",
         gold_path=out_dir / f"{stem}_gold.md",
-        preflight_path=out_dir / f"{stem}_preflight.json",
         profile_name=profile,
         out_dir=out_dir,
         yes=bool(args.yes),
@@ -1397,7 +1305,7 @@ def setup_directories(config: Config) -> None:
                     f"   进度：{config.knowledge_path}\n"
                     f"   源 PDF：{config.pdf_source}\n"
                     f"   副本：  {config.pdf_path}（仍保留，未覆盖）\n"
-                    "   新书：删除 knowledge JSON 与 _preflight.json 后重跑；\n"
+                    "   新书：删除 knowledge JSON 后重跑；\n"
                     "   同书：请恢复与进度匹配的 PDF。"
                 )
             # source == stored 但 dest 不同：用源刷新副本
@@ -1407,7 +1315,7 @@ def setup_directories(config: Config) -> None:
                 f"   进度：{config.knowledge_path}\n"
                 f"   源 PDF：{config.pdf_source}\n"
                 f"   副本：  {config.pdf_path}\n"
-                "   请删除 knowledge（及 preflight）后按当前 PDF 重跑。"
+                "   请删除 knowledge JSON 后按当前 PDF 重跑。"
             )
 
     shutil.copy2(config.pdf_source, config.pdf_path)
@@ -1441,6 +1349,10 @@ def save_knowledge_state(
     pdf_page_count: int | None = None,
     preflight_assessment: PreflightAssessment | dict | None = None,
     mapping_overrides: list[str] | None = None,
+    chosen_profile: str | None = None,
+    sample_pages: list[int] | None = None,
+    proposed_strategy_label: str | None = None,
+    confirmed_via: str | None = None,
 ) -> None:
     print(
         colored(
@@ -1474,6 +1386,11 @@ def save_knowledge_state(
         "strategy_spec",
         "preflight_assessment",
         "mapping_overrides",
+        "chosen_profile",
+        "sample_pages",
+        "proposed_strategy_label",
+        "confirmed_via",
+        "decision_version",
     ):
         if key in prev_meta:
             meta[key] = prev_meta[key]
@@ -1502,6 +1419,16 @@ def save_knowledge_state(
             meta["preflight_assessment"] = preflight_assessment
     if mapping_overrides is not None:
         meta["mapping_overrides"] = list(mapping_overrides)
+    if chosen_profile is not None:
+        meta["chosen_profile"] = chosen_profile
+        meta["profile"] = chosen_profile  # 与 CLI 解耦，记录实际选用
+    if sample_pages is not None:
+        meta["sample_pages"] = list(sample_pages)
+    if proposed_strategy_label is not None:
+        meta["proposed_strategy_label"] = proposed_strategy_label
+    if confirmed_via is not None:
+        meta["confirmed_via"] = confirmed_via
+        meta["decision_version"] = PREFLIGHT_DECISION_VERSION
     payload = {
         "knowledge": [item.to_dict() for item in state.knowledge],
         "next_page": state.next_page,
@@ -1648,7 +1575,7 @@ def validate_progress(
                 "❌ 进度已有内容但缺少 pdf_sha256 指纹（旧版或手工 JSON）。\n"
                 f"   文件：{config.knowledge_path}\n"
                 "   无法验证 PDF 是否与抽取时一致。\n"
-                "   请删除 knowledge（及 preflight）后按当前 PDF 重跑。",
+                "   请删除 knowledge JSON 后按当前 PDF 重跑。",
                 "yellow",
             ),
             file=sys.stderr,
@@ -2601,11 +2528,10 @@ PDF：    {config.pdf_source}
 档位：   {config.profile_name}
 产出目录：{config.out_dir}
 进度：   {config.knowledge_path}
-采样决议：{config.preflight_path}
 总结：   {config.summary_path}
 金标准： {config.gold_path}（可选）
 切换：   --profile auto|economy|balanced|quality
-提示：   Ctrl+C 可中断；auto 决议见采样文件，删之可重选
+提示：   Ctrl+C 可中断；策略在 knowledge 中，删之可重选
 """,
                 "cyan",
             )
@@ -2651,10 +2577,9 @@ PDF：    {config.pdf_source}
                     f"   重写总结 → 删除该 md 后再执行\n"
                     f"   人工润色 → 另存为 {config.gold_path.name} 供下次总结参考\n"
                     f"   重抽全书 → 删除 knowledge JSON 后再执行\n"
-                    f"   重做 auto 预读/改选 → 删除采样文件：\n"
-                    f"   {config.preflight_path}\n"
-                    f"   换策略 → --profile … 后重跑"
-                    f"（总结立即生效；抽取模型变化须重抽）",
+                    f"   重做 auto 预读/改选 → 删除 knowledge 后重跑\n"
+                    f"   换总结策略 → --profile … 且已抽完时重跑（仅 md 删后）\n"
+                    f"   换抽取模型 → 须删除 knowledge 重抽",
                     "green",
                 )
             )
@@ -2663,42 +2588,16 @@ PDF：    {config.pdf_source}
 
         client = create_client()
 
-        # —— 策略：auto 读采样决议 / 预读确认；固定档直接解析 ——
+        # —— 策略：auto 读 knowledge.meta / 预读确认；固定档直接解析 ——
         profile = config.profile_name.strip().lower()
         kb_chars = sum(len(i.text) for i in state.knowledge) or None
-        fresh_assessment: PreflightAssessment | None = None
-        fresh_overrides: list[str] = []
+        decision_extra: dict = {}
         pdf_sha = file_sha256(config.pdf_path)
 
         if profile == "auto":
             strategy = None
-            decision = load_preflight_decision(config.preflight_path)
-            if decision is not None:
-                restored = validate_preflight_decision(
-                    decision,
-                    pdf_sha256=pdf_sha,
-                    total_pages=total_pages,
-                )
-                if restored is not None:
-                    strategy = resolve_strategy(
-                        restored.name if restored.name in VALID_PROFILES else "auto",
-                        total_pages=total_pages,
-                        knowledge_chars=kb_chars,
-                        prebuilt=restored,
-                    )
-                    chosen = decision.get("chosen_profile") or restored.name
-                    print(
-                        colored(
-                            f"♻️  复用采样决议（{config.preflight_path.name}）\n"
-                            f"   当时选择：{chosen}\n"
-                            f"   策略：{strategy.label()}\n"
-                            f"   重新预读/改选：删除该采样文件后再运行",
-                            "cyan",
-                        )
-                    )
-
-            # 无采样文件：旧 knowledge 已有策略 → 静默迁移，避免打断续跑
-            if strategy is None and progress.stored_strategy is not None:
+            # 1) knowledge 已有 strategy_spec → 复用（策略与进度同一文件）
+            if progress.stored_strategy is not None:
                 strategy = resolve_strategy(
                     progress.stored_strategy.name
                     if progress.stored_strategy.name in VALID_PROFILES
@@ -2707,20 +2606,39 @@ PDF：    {config.pdf_source}
                     knowledge_chars=kb_chars,
                     prebuilt=progress.stored_strategy,
                 )
-                migrate_legacy_strategy_to_preflight(
-                    config,
-                    strategy,
-                    pdf_sha256=pdf_sha,
-                    total_pages=total_pages,
-                    meta=progress.meta,
-                )
+                chosen = progress.meta.get("chosen_profile") or strategy.name
                 print(
                     colored(
-                        "♻️  由进度中的策略生成采样文件（跳过确认）\n"
-                        f"   策略：{strategy.label()}",
+                        f"♻️  复用 knowledge 中的策略（{chosen}）\n"
+                        f"   {strategy.label()}\n"
+                        f"   重新预读/改选：删除 {config.knowledge_path.name} 后重跑",
                         "cyan",
                     )
                 )
+            else:
+                # 2) 兼容旧版独立 _preflight.json
+                legacy = try_import_legacy_preflight_file(
+                    config, pdf_sha256=pdf_sha, total_pages=total_pages
+                )
+                if legacy is not None:
+                    strategy, leg = legacy
+                    strategy = resolve_strategy(
+                        strategy.name if strategy.name in VALID_PROFILES else "auto",
+                        total_pages=total_pages,
+                        knowledge_chars=kb_chars,
+                        prebuilt=strategy,
+                    )
+                    decision_extra = {
+                        "preflight_assessment": leg.get("assessment"),
+                        "mapping_overrides": leg.get("mapping_overrides") or [],
+                        "chosen_profile": leg.get("chosen_profile") or strategy.name,
+                        "sample_pages": leg.get("sample_pages") or [],
+                        "proposed_strategy_label": leg.get(
+                            "proposed_strategy_label"
+                        )
+                        or strategy.label(),
+                        "confirmed_via": "legacy_preflight_file",
+                    }
 
             if strategy is None:
                 sample_idx = pick_preflight_pages(total_pages)
@@ -2770,21 +2688,14 @@ PDF：    {config.pdf_source}
                     )
                     confirmed_via = "interactive_override"
 
-                save_preflight_decision(
-                    config.preflight_path,
-                    pdf_name=config.pdf_name,
-                    pdf_sha256=pdf_sha,
-                    total_pages=total_pages,
-                    sample_pages=sample_pages_1b,
-                    assessment=assessment,
-                    mapping_overrides=map_overrides,
-                    proposed_label=proposed.label(),
-                    chosen_profile=chosen_profile,
-                    strategy=strategy,
-                    confirmed_via=confirmed_via,
-                )
-                fresh_assessment = assessment
-                fresh_overrides = map_overrides
+                decision_extra = {
+                    "preflight_assessment": assessment,
+                    "mapping_overrides": map_overrides,
+                    "chosen_profile": chosen_profile,
+                    "sample_pages": sample_pages_1b,
+                    "proposed_strategy_label": proposed.label(),
+                    "confirmed_via": confirmed_via,
+                }
         else:
             strategy = resolve_strategy(
                 config.profile_name,
@@ -2792,17 +2703,24 @@ PDF：    {config.pdf_source}
                 knowledge_chars=kb_chars,
             )
 
-        # 抽取未完成时切换抽取模型/thinking → 拒绝混档
-        if (
-            progress.stored_strategy is not None
-            and 0 < state.next_page < total_pages
-        ):
+        # 抽取未完成时：不可更换抽取模型（无 strategy_spec 的中途进度须删 knowledge）
+        if 0 < state.next_page < total_pages:
+            if progress.stored_strategy is None:
+                print(
+                    colored(
+                        "❌ 进度已开始抽取，但 knowledge 中无 strategy_spec。\n"
+                        f"   文件：{config.knowledge_path}\n"
+                        "   请删除 knowledge 后重抽。",
+                        "yellow",
+                    ),
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
             prev = progress.stored_strategy
-            extract_changed = (
+            if (
                 prev.extract_model != strategy.extract_model
                 or prev.extract_thinking != strategy.extract_thinking
-            )
-            if extract_changed:
+            ):
                 print(
                     colored(
                         "❌ 抽取未完成，但本次策略的抽取设置与进度不一致：\n"
@@ -2811,7 +2729,7 @@ PDF：    {config.pdf_source}
                         f"   本次：{strategy.extract_model}"
                         f"{'+thinking' if strategy.extract_thinking else ''}\n"
                         "   继续会导致前后页混用不同模型。\n"
-                        "   处理：保持原 --profile 续跑；或删除 knowledge/preflight 后重抽。",
+                        "   处理：保持原 --profile 续跑；或删除 knowledge 后重抽。",
                         "yellow",
                     ),
                     file=sys.stderr,
@@ -2822,13 +2740,11 @@ PDF：    {config.pdf_source}
         print(colored(f"⚙️  生效策略：{strategy.label()}", "cyan"))
         print(colored(f"   {strategy.description}", "cyan"))
 
-        # 尽早写入指纹与 strategy_spec（及预读快照），便于中断后续跑
-        save_kwargs: dict = {
-            "pdf_page_count": total_pages,
-        }
-        if fresh_assessment is not None:
-            save_kwargs["preflight_assessment"] = fresh_assessment
-            save_kwargs["mapping_overrides"] = fresh_overrides
+        # 尽早写入指纹与 strategy_spec（及 auto 决议），便于中断后续跑
+        save_kwargs: dict = {"pdf_page_count": total_pages}
+        save_kwargs.update(
+            {k: v for k, v in decision_extra.items() if v is not None}
+        )
         save_knowledge_state(config, state, strategy, **save_kwargs)
 
         try:
