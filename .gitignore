@@ -57,3 +57,4 @@ htmlcov/
 .ruff_cache/
 *.pdf
 *.json
+.envrc
