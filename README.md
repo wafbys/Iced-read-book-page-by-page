@@ -44,9 +44,6 @@ python read_books.py your_book.pdf -p auto
 # 指定产出目录（默认 ./book_analysis，相对当前工作目录）
 python read_books.py your_book.pdf --out-dir ./my_out
 
-# 仅用于：无指纹旧进度继续、中途故意混用抽取模型（不能用于同名换书）
-python read_books.py your_book.pdf --force
-
 # auto 跳过交互确认，直接采用预读映射（脚本/CI）
 python read_books.py your_book.pdf -y
 ```
@@ -56,7 +53,6 @@ python read_books.py your_book.pdf -y
 | `pdf` | PDF 路径或文件名（必填） |
 | `--profile` / `-p` | `auto` \| `economy` \| `balanced` \| `quality`（默认 `auto`） |
 | `--out-dir` | 产出目录（默认 `book_analysis`，相对 **当前工作目录**） |
-| `--force` | 无指纹旧进度继续（补写指纹）；或中途切换不一致抽取模型。**不能**同名换书（请删 knowledge） |
 | `--yes` / `-y` | auto 模式跳过确认，直接采用预读映射策略 |
 
 未传 `--profile` 时，可读环境变量 `READ_BOOKS_PROFILE` 作为后备。
@@ -94,10 +90,9 @@ book_analysis/              # 或 --out-dir 指定的目录
 
 - 产出目录默认是 **进程当前工作目录** 下的 `book_analysis/`，不是脚本所在目录。换目录执行同一命令会写成另一套进度。
 - 进度按 **PDF 文件名**（stem）区分：`书名_knowledge.json`。同名不同内容会通过 **SHA-256 指纹** 检测；不一致时拒绝续跑，需删 JSON 或换回原 PDF。
-- 旧进度若 **缺少指纹** 且已有实质内容：须 `--force` 确认当前 PDF（随后补写指纹）；无指纹时覆盖副本也需 `--force`。  
-- **有指纹且源 PDF ≠ 进度**：一律拒绝覆盖副本（`--force` 无效），避免毁掉正确副本；新书请删 knowledge / preflight。  
+- **有指纹且源 PDF ≠ 进度**：拒绝覆盖副本；新书请删 knowledge / preflight 后重跑。  
+- **旧进度缺指纹** 或 **中途换抽取模型**：直接拒绝；请删产物后重跑（不提供 `--force`）。  
 - auto 决议在 **`书名_preflight.json`**：有则跳过确认；删之可重选。  
-- 抽取未完成时切换会改变抽页模型的 `--profile`：默认拒绝；确认混档可加 `--force`。
 - 长书审校时若知识点过长需抽样，审校改为 **只补页码、禁止按残缺知识删初稿**。
 
 ## 重复执行

@@ -967,7 +967,6 @@ class Config:
     preflight_path: Path
     profile_name: str
     out_dir: Path
-    force: bool = False
     yes: bool = False  # 跳过 auto 交互确认，直接采用映射策略
 
 
@@ -1246,15 +1245,6 @@ def parse_args(argv: list[str] | None = None) -> Config:
         help=f"产出目录（默认 {DEFAULT_OUT_DIR}，相对当前工作目录）",
     )
     parser.add_argument(
-        "--force",
-        action="store_true",
-        help=(
-            "允许：无指纹的旧进度继续（将补写指纹）；"
-            "抽取未完成时切换不一致的抽取模型。"
-            "不能用于同名换书——请删除 knowledge 后重跑"
-        ),
-    )
-    parser.add_argument(
         "--yes",
         "-y",
         action="store_true",
@@ -1294,7 +1284,6 @@ def parse_args(argv: list[str] | None = None) -> Config:
         preflight_path=out_dir / f"{stem}_preflight.json",
         profile_name=profile,
         out_dir=out_dir,
-        force=bool(args.force),
         yes=bool(args.yes),
     )
 
@@ -1402,7 +1391,6 @@ def setup_directories(config: Config) -> None:
         meta = _load_knowledge_meta(config.knowledge_path)
         stored_sha = meta.get("pdf_sha256")
         if stored_sha:
-            # 有指纹且源≠进度：禁止覆盖（--force 也不行，否则会毁掉匹配副本后校验失败）
             if source_sha != stored_sha:
                 raise SystemExit(
                     "❌ 源 PDF 与进度指纹不一致（可能同名换书）。\n"
@@ -1410,19 +1398,16 @@ def setup_directories(config: Config) -> None:
                     f"   源 PDF：{config.pdf_source}\n"
                     f"   副本：  {config.pdf_path}（仍保留，未覆盖）\n"
                     "   新书：删除 knowledge JSON 与 _preflight.json 后重跑；\n"
-                    "   同书：请恢复与进度匹配的 PDF。\n"
-                    "   说明：--force 不能用于换书（会先毁掉正确副本再失败）。"
+                    "   同书：请恢复与进度匹配的 PDF。"
                 )
             # source == stored 但 dest 不同：用源刷新副本
-        elif source_sha != dest_sha and not config.force:
-            # 旧进度无指纹：禁止静默用不同内容覆盖副本
+        elif source_sha != dest_sha:
             raise SystemExit(
                 "❌ 已有进度但缺少 PDF 指纹，拒绝用不同内容的源文件覆盖副本。\n"
                 f"   进度：{config.knowledge_path}\n"
                 f"   源 PDF：{config.pdf_source}\n"
                 f"   副本：  {config.pdf_path}\n"
-                "   新书：删除 knowledge 后重抽；\n"
-                "   确认源与当前书一致：加 --force（将覆盖副本并在保存时写入指纹）。"
+                "   请删除 knowledge（及 preflight）后按当前 PDF 重跑。"
             )
 
     shutil.copy2(config.pdf_source, config.pdf_path)
@@ -1657,15 +1642,13 @@ def validate_progress(
                 file=sys.stderr,
             )
             raise SystemExit(1)
-    elif has_work and not stored_sha and not config.force:
-        # 已有实质进度却无指纹：要求用户确认（下次 save 会补指纹）
+    elif has_work and not stored_sha:
         print(
             colored(
-                "⚠️  进度已有内容但缺少 pdf_sha256 指纹（旧版或手工 JSON）。\n"
+                "❌ 进度已有内容但缺少 pdf_sha256 指纹（旧版或手工 JSON）。\n"
                 f"   文件：{config.knowledge_path}\n"
                 "   无法验证 PDF 是否与抽取时一致。\n"
-                "   若确认当前 PDF 就是原书：加 --force 继续（将写入指纹）；\n"
-                "   若不确定：删除 knowledge 后重抽。",
+                "   请删除 knowledge（及 preflight）后按当前 PDF 重跑。",
                 "yellow",
             ),
             file=sys.stderr,
@@ -2809,7 +2792,7 @@ PDF：    {config.pdf_source}
                 knowledge_chars=kb_chars,
             )
 
-        # 抽取未完成时切换抽取模型/thinking → 混档 knowledge，需 --force
+        # 抽取未完成时切换抽取模型/thinking → 拒绝混档
         if (
             progress.stored_strategy is not None
             and 0 < state.next_page < total_pages
@@ -2819,7 +2802,7 @@ PDF：    {config.pdf_source}
                 prev.extract_model != strategy.extract_model
                 or prev.extract_thinking != strategy.extract_thinking
             )
-            if extract_changed and not config.force:
+            if extract_changed:
                 print(
                     colored(
                         "❌ 抽取未完成，但本次策略的抽取设置与进度不一致：\n"
@@ -2828,8 +2811,7 @@ PDF：    {config.pdf_source}
                         f"   本次：{strategy.extract_model}"
                         f"{'+thinking' if strategy.extract_thinking else ''}\n"
                         "   继续会导致前后页混用不同模型。\n"
-                        "   处理：保持原 --profile 续跑；或删 knowledge 重抽；\n"
-                        "   或加 --force 确认接受混档。",
+                        "   处理：保持原 --profile 续跑；或删除 knowledge/preflight 后重抽。",
                         "yellow",
                     ),
                     file=sys.stderr,

@@ -308,12 +308,6 @@ def test_validate_progress_missing_fingerprint_with_work(tmp_path: Path):
     with pytest.raises(SystemExit):
         validate_progress(progress, cfg, total_pages=10)
 
-    cfg_force = parse_args(
-        [str(pdf), "--out-dir", str(out), "--force"]
-    )
-    # force 后通过（不再因缺指纹退出）
-    validate_progress(progress, cfg_force, total_pages=10)
-
 
 def test_setup_directories_blocks_overwrite_without_fingerprint(tmp_path: Path):
     src = tmp_path / "src"
@@ -330,16 +324,14 @@ def test_setup_directories_blocks_overwrite_without_fingerprint(tmp_path: Path):
     )
     with pytest.raises(SystemExit):
         setup_directories(cfg)
-
-    cfg_force = parse_args([str(pdf), "--out-dir", str(out), "--force"])
-    setup_directories(cfg_force)
-    assert cfg_force.pdf_path.read_bytes() == b"%PDF-source-v1"
+    # 副本保持原样
+    assert cfg.pdf_path.read_bytes() == b"%PDF-dest-old!!"
 
 
-def test_setup_directories_never_force_overwrite_on_fingerprint_mismatch(
+def test_setup_directories_blocks_overwrite_on_fingerprint_mismatch(
     tmp_path: Path,
 ):
-    """有指纹且源≠进度时，--force 也不得覆盖与进度匹配的副本。"""
+    """有指纹且源≠进度时不得覆盖与进度匹配的副本。"""
     src = tmp_path / "src"
     out = tmp_path / "out"
     src.mkdir()
@@ -360,10 +352,10 @@ def test_setup_directories_never_force_overwrite_on_fingerprint_mismatch(
         ),
         encoding="utf-8",
     )
-    cfg = parse_args([str(pdf), "--out-dir", str(out), "--force"])
+    cfg = parse_args([str(pdf), "--out-dir", str(out)])
     with pytest.raises(SystemExit):
         setup_directories(cfg)
-    assert dest.read_bytes() == old  # 副本未被破坏
+    assert dest.read_bytes() == old
 
 
 def test_page_content_missing_knowledge_ok():
@@ -375,13 +367,6 @@ def test_page_content_missing_knowledge_ok():
 def test_review_prompts_differ_on_deletion():
     assert "禁止删除" in REVIEW_CITE_ONLY_PROMPT
     assert "删除初稿" in REVIEW_SYSTEM_PROMPT or "删除" in REVIEW_SYSTEM_PROMPT
-
-
-def test_parse_args_force(tmp_path: Path):
-    cfg = parse_args(["a.pdf", "--force", "--out-dir", str(tmp_path)])
-    assert cfg.force is True
-    cfg2 = parse_args(["a.pdf", "--out-dir", str(tmp_path)])
-    assert cfg2.force is False
 
 
 def test_parse_args_yes_and_preflight_path(tmp_path: Path):
