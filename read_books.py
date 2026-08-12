@@ -41,7 +41,7 @@ from openai import (
     OpenAI,
     RateLimitError,
 )
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from termcolor import colored
 
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
@@ -577,6 +577,7 @@ class Config:
     gold_path: Path
     profile_name: str
     out_dir: Path
+    force: bool = False
 
 
 @dataclass
@@ -611,7 +612,7 @@ class ProgressLoad:
 
 class PageContent(BaseModel):
     has_content: bool
-    knowledge: list[str]
+    knowledge: list[str] = Field(default_factory=list)
 
 
 EXTRACT_SYSTEM_PROMPT = """你是顶级学术读书笔记助手。根据**当前页**正文提取可复习、可对照原文的知识点。
@@ -679,7 +680,7 @@ REVIEW_SYSTEM_PROMPT = """你是严格的技术编辑兼事实核对员。将「
 
 你有：
 1) 初稿 Markdown
-2) 原始知识点列表（带页码，权威事实来源）
+2) 原始知识点列表（带页码，权威事实来源，**完整**）
 3) 可选：PDF 书签、人工金标准
 
 修订要求：
@@ -692,6 +693,22 @@ REVIEW_SYSTEM_PROMPT = """你是严格的技术编辑兼事实核对员。将「
 
 只输出修订后的 Markdown 全文。
 """
+
+# 知识点过长被抽样时：禁止按残缺 KB 做破坏性删改
+REVIEW_CITE_ONLY_PROMPT = """你是页码补全编辑。初稿已由**完整**知识点生成；下方知识点仅为**抽样**，不完整。
+
+硬性规则：
+- 输出完整修订后 Markdown（仍含 导读 / 分题详述 / 主题索引）
+- **禁止删除**初稿中的实质段落或 bullet（抽样不足以判定「无依据」）
+- 仅允许：为缺少页码的 bullet 补（第 N 页）；轻微统一术语/润色措辞
+- 页码只能来自初稿已有标注或抽样知识点中的页码；禁止编造
+- 勿因抽样未见某概念而删改或否定初稿内容
+- 勿引入新事实
+
+只输出修订后的 Markdown 全文。
+"""
+
+REVIEW_KB_FULL_CHARS = 100_000
 
 
 def _unique_sorted_pages(pages: list[int]) -> list[int]:
@@ -786,6 +803,14 @@ def parse_args(argv: list[str] | None = None) -> Config:
         default=DEFAULT_OUT_DIR,
         help=f"产出目录（默认 {DEFAULT_OUT_DIR}，相对当前工作目录）",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "允许：无指纹进度时覆盖 PDF 副本；"
+            "抽取未完成时切换与进度不一致的抽取模型"
+        ),
+    )
     args = parser.parse_args(argv)
 
     source = Path(args.pdf)
@@ -819,6 +844,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         gold_path=out_dir / f"{stem}_gold.md",
         profile_name=profile,
         out_dir=out_dir,
+        force=bool(args.force),
     )
 
 
@@ -888,6 +914,16 @@ def chat_create_with_retry(client: OpenAI, **kwargs):
     raise last_error
 
 
+def _load_knowledge_meta(path: Path) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        meta = data.get("meta")
+        return meta if isinstance(meta, dict) else {}
+    except (OSError, json.JSONDecodeError, TypeError):
+        return {}
+
+
 def setup_directories(config: Config) -> None:
     config.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -897,32 +933,46 @@ def setup_directories(config: Config) -> None:
             print(colored(f"📄 已复制 PDF → {config.pdf_path}", "green"))
         else:
             raise FileNotFoundError(f"找不到 PDF：{config.pdf_source}")
-    elif (
-        config.pdf_source.exists()
-        and config.pdf_source.resolve() != config.pdf_path.resolve()
+        return
+
+    if (
+        not config.pdf_source.exists()
+        or config.pdf_source.resolve() == config.pdf_path.resolve()
     ):
-        # 若已有进度且指纹与源 PDF 不一致，拒绝静默覆盖（防同名换书）
-        if config.knowledge_path.exists():
-            try:
-                with open(config.knowledge_path, "r", encoding="utf-8") as f:
-                    existing = json.load(f)
-                stored_sha = (existing.get("meta") or {}).get("pdf_sha256")
-                if stored_sha:
-                    source_sha = file_sha256(config.pdf_source)
-                    if source_sha != stored_sha:
-                        raise SystemExit(
-                            "❌ 源 PDF 内容与进度文件中的指纹不一致（可能同名换书）。\n"
-                            f"   进度：{config.knowledge_path}\n"
-                            f"   源 PDF：{config.pdf_source}\n"
-                            "   若确认是新书：删除 knowledge JSON 后重跑；\n"
-                            "   若仍是同一本书：请恢复原 PDF 或检查路径。"
-                        )
-            except SystemExit:
-                raise
-            except (OSError, json.JSONDecodeError, TypeError):
-                pass
-        shutil.copy2(config.pdf_source, config.pdf_path)
-        print(colored(f"📄 已更新 PDF 副本 → {config.pdf_path}", "green"))
+        return
+
+    # 源与副本不同路径：更新前校验，防同名换书污染进度
+    source_sha = file_sha256(config.pdf_source)
+    dest_sha = file_sha256(config.pdf_path)
+    if source_sha == dest_sha:
+        return  # 内容相同，无需覆盖
+
+    if config.knowledge_path.exists():
+        meta = _load_knowledge_meta(config.knowledge_path)
+        stored_sha = meta.get("pdf_sha256")
+        if stored_sha:
+            if source_sha != stored_sha and not config.force:
+                raise SystemExit(
+                    "❌ 源 PDF 内容与进度文件中的指纹不一致（可能同名换书）。\n"
+                    f"   进度：{config.knowledge_path}\n"
+                    f"   源 PDF：{config.pdf_source}\n"
+                    "   若确认是新书：删除 knowledge JSON 后重跑；\n"
+                    "   若仍是同一本书：请恢复原 PDF。\n"
+                    "   强制覆盖（危险）：加 --force"
+                )
+        elif not config.force:
+            # 旧进度无指纹：禁止静默用新内容覆盖副本
+            raise SystemExit(
+                "❌ 已有进度但缺少 PDF 指纹，拒绝用不同内容的源文件覆盖副本。\n"
+                f"   进度：{config.knowledge_path}\n"
+                f"   源 PDF：{config.pdf_source}\n"
+                f"   副本：  {config.pdf_path}\n"
+                "   处理：删除 knowledge 后按新书重抽；\n"
+                "   或确认源与当前书一致后加 --force（将写入新指纹）。"
+            )
+
+    shutil.copy2(config.pdf_source, config.pdf_path)
+    print(colored(f"📄 已更新 PDF 副本 → {config.pdf_path}", "green"))
 
 
 def atomic_write_json(path: Path, payload: dict) -> None:
@@ -1117,6 +1167,7 @@ def validate_progress(
 
     meta = progress.meta
     stored_sha = meta.get("pdf_sha256")
+    has_work = state.next_page > 0 or bool(state.knowledge)
     if stored_sha and config.pdf_path.exists():
         try:
             current_sha = file_sha256(config.pdf_path)
@@ -1141,6 +1192,20 @@ def validate_progress(
                 file=sys.stderr,
             )
             raise SystemExit(1)
+    elif has_work and not stored_sha and not config.force:
+        # 已有实质进度却无指纹：要求用户确认（下次 save 会补指纹）
+        print(
+            colored(
+                "⚠️  进度已有内容但缺少 pdf_sha256 指纹（旧版或手工 JSON）。\n"
+                f"   文件：{config.knowledge_path}\n"
+                "   无法验证 PDF 是否与抽取时一致。\n"
+                "   若确认当前 PDF 就是原书：加 --force 继续（将写入指纹）；\n"
+                "   若不确定：删除 knowledge 后重抽。",
+                "yellow",
+            ),
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
 
     stored_pages = meta.get("pdf_page_count")
     if stored_pages is not None:
@@ -1715,15 +1780,10 @@ def generate_summary(
 
     summary = draft
     if strategy.do_review:
-        print(
-            colored(
-                f"   · 编辑审校（{strategy.review_effort}）…",
-                "cyan",
-            )
-        )
         kb_lines = [i.as_line() for i in knowledge]
         kb_blob = "\n".join(kb_lines)
-        if len(kb_blob) > 100_000:
+        kb_truncated = len(kb_blob) > REVIEW_KB_FULL_CHARS
+        if kb_truncated:
             by_page: dict[int, list[str]] = {}
             for item in knowledge:
                 by_page.setdefault(item.page, []).append(item.text)
@@ -1735,6 +1795,23 @@ def generate_summary(
                 "（知识点过长，每页最多 2 条抽样；页码集合："
                 f"{sorted(by_page.keys())}）\n" + "\n".join(sample)
             )
+            # 残缺 KB 下禁止破坏性「对照删除」
+            review_system = REVIEW_CITE_ONLY_PROMPT
+            print(
+                colored(
+                    f"   · 编辑审校（{strategy.review_effort}，"
+                    "知识点过长→仅补页码/禁止删内容）…",
+                    "cyan",
+                )
+            )
+        else:
+            review_system = REVIEW_SYSTEM_PROMPT
+            print(
+                colored(
+                    f"   · 编辑审校（{strategy.review_effort}）…",
+                    "cyan",
+                )
+            )
 
         review_user = (
             f"{toc_hint}{gold_hint}"
@@ -1744,7 +1821,7 @@ def generate_summary(
         reviewed = _chat_summary_model(
             client,
             strategy,
-            REVIEW_SYSTEM_PROMPT,
+            review_system,
             review_user,
             reasoning_effort=strategy.review_effort,
         )
@@ -1767,13 +1844,19 @@ def generate_summary(
                     "yellow",
                 )
             )
+            escalate_extra = (
+                "\n\n【加严】上一版页码引用不足：请为每个 bullet 补全"
+                "（第 N 页）。"
+            )
+            if kb_truncated:
+                escalate_extra += " 知识点仍为抽样：禁止删除初稿实质内容。"
+            else:
+                escalate_extra += " 并对照完整知识点查漏。"
             boosted = _chat_summary_model(
                 client,
                 strategy,
-                REVIEW_SYSTEM_PROMPT,
-                review_user
-                + "\n\n【加严】上一版页码引用不足：请为每个 bullet 补全"
-                "（第 N 页），并对照知识点查漏。",
+                review_system,
+                review_user + escalate_extra,
                 reasoning_effort="max",
             )
             if boosted.strip():
@@ -1819,7 +1902,7 @@ def save_summary(
     state: KnowledgeState,
     strategy: PipelineStrategy,
 ) -> None:
-    if not summary:
+    if not (summary or "").strip():
         print(colored("⏭️  无总结内容，未写入", "yellow"))
         return
 
@@ -2005,10 +2088,10 @@ PDF：    {config.pdf_source}
         profile = config.profile_name.strip().lower()
         kb_chars = sum(len(i.text) for i in state.knowledge) or None
         if profile == "auto":
+            # 有合法 auto strategy_spec 即复用（含 next_page==0 首页中断后续跑）
             can_reuse = (
                 progress.stored_strategy is not None
                 and progress.stored_strategy.name == "auto"
-                and (state.next_page > 0 or extract_done)
             )
             if can_reuse:
                 strategy = resolve_strategy(
@@ -2047,6 +2130,34 @@ PDF：    {config.pdf_source}
                 total_pages=total_pages,
                 knowledge_chars=kb_chars,
             )
+
+        # 抽取未完成时切换抽取模型/thinking → 混档 knowledge，需 --force
+        if (
+            progress.stored_strategy is not None
+            and 0 < state.next_page < total_pages
+        ):
+            prev = progress.stored_strategy
+            extract_changed = (
+                prev.extract_model != strategy.extract_model
+                or prev.extract_thinking != strategy.extract_thinking
+            )
+            if extract_changed and not config.force:
+                print(
+                    colored(
+                        "❌ 抽取未完成，但本次策略的抽取设置与进度不一致：\n"
+                        f"   进度：{prev.extract_model}"
+                        f"{'+thinking' if prev.extract_thinking else ''}\n"
+                        f"   本次：{strategy.extract_model}"
+                        f"{'+thinking' if strategy.extract_thinking else ''}\n"
+                        "   继续会导致前后页混用不同模型。\n"
+                        "   处理：保持原 --profile 续跑；或删 knowledge 重抽；\n"
+                        "   或加 --force 确认接受混档。",
+                        "yellow",
+                    ),
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
+
         active_strategy = strategy
         print(colored(f"⚙️  生效策略：{strategy.label()}", "cyan"))
         print(colored(f"   {strategy.description}", "cyan"))
@@ -2109,6 +2220,15 @@ PDF：    {config.pdf_source}
                     colored("⚠️  无知识点，无法生成总结", "yellow"),
                     file=sys.stderr,
                 )
+                print(format_skip_meta(state), file=sys.stderr)
+                print(
+                    colored(
+                        "   提示：若几乎全是「文字过短」，PDF 可能是扫描版，"
+                        "需先 OCR。",
+                        "cyan",
+                    ),
+                    file=sys.stderr,
+                )
                 raise SystemExit(1)
 
             print(colored("\n📋 跳过统计", "cyan"))
@@ -2123,6 +2243,16 @@ PDF：    {config.pdf_source}
                 toc=toc,
             )
             active_strategy = strategy
+            if not (summary or "").strip():
+                print(
+                    colored(
+                        "❌ 总结生成结果为空（模型 content 为空），未写入 md。\n"
+                        "   进度 knowledge 已保留；可稍后直接再跑以重试总结。",
+                        "yellow",
+                    ),
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
             save_summary(config, summary, state, strategy)
 
         except (APIStatusError, APIError, APIConnectionError, APITimeoutError) as exc:

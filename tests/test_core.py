@@ -10,9 +10,12 @@ import pytest
 from read_books import (
     KnowledgeItem,
     KnowledgeState,
+    PageContent,
     PipelineStrategy,
     PreflightAssessment,
     ProgressLoad,
+    REVIEW_CITE_ONLY_PROMPT,
+    REVIEW_SYSTEM_PROMPT,
     chunk_items,
     empty_state,
     file_sha256,
@@ -21,6 +24,7 @@ from read_books import (
     parse_args,
     pick_preflight_pages,
     resolve_strategy,
+    setup_directories,
     strategy_from_assessment,
     validate_progress,
     _base_profiles,
@@ -184,6 +188,75 @@ def test_validate_progress_fingerprint_mismatch(tmp_path: Path):
     )
     with pytest.raises(SystemExit):
         validate_progress(progress, cfg, total_pages=1)
+
+
+def test_validate_progress_missing_fingerprint_with_work(tmp_path: Path):
+    src = tmp_path / "src"
+    out = tmp_path / "out"
+    src.mkdir()
+    out.mkdir()
+    pdf = src / "book.pdf"
+    pdf.write_bytes(b"%PDF-1.4 content")
+    cfg = parse_args([str(pdf), "--out-dir", str(out)])
+    cfg.pdf_path.write_bytes(b"%PDF-1.4 content")
+    progress = ProgressLoad(
+        state=KnowledgeState(
+            knowledge=[KnowledgeItem(1, "point")],
+            next_page=3,
+            skipped_blank=[],
+            skipped_model=[],
+            skipped_parse=[],
+        ),
+        meta={},  # 无指纹
+        stored_strategy=None,
+    )
+    with pytest.raises(SystemExit):
+        validate_progress(progress, cfg, total_pages=10)
+
+    cfg_force = parse_args(
+        [str(pdf), "--out-dir", str(out), "--force"]
+    )
+    # force 后通过（不再因缺指纹退出）
+    validate_progress(progress, cfg_force, total_pages=10)
+
+
+def test_setup_directories_blocks_overwrite_without_fingerprint(tmp_path: Path):
+    src = tmp_path / "src"
+    out = tmp_path / "out"
+    src.mkdir()
+    out.mkdir()
+    pdf = src / "book.pdf"
+    pdf.write_bytes(b"%PDF-source-v1")
+    cfg = parse_args([str(pdf), "--out-dir", str(out)])
+    cfg.pdf_path.write_bytes(b"%PDF-dest-old!!")
+    cfg.knowledge_path.write_text(
+        json.dumps({"next_page": 2, "knowledge": [], "meta": {}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit):
+        setup_directories(cfg)
+
+    cfg_force = parse_args([str(pdf), "--out-dir", str(out), "--force"])
+    setup_directories(cfg_force)
+    assert cfg_force.pdf_path.read_bytes() == b"%PDF-source-v1"
+
+
+def test_page_content_missing_knowledge_ok():
+    pc = PageContent.model_validate({"has_content": False})
+    assert pc.has_content is False
+    assert pc.knowledge == []
+
+
+def test_review_prompts_differ_on_deletion():
+    assert "禁止删除" in REVIEW_CITE_ONLY_PROMPT
+    assert "删除初稿" in REVIEW_SYSTEM_PROMPT or "删除" in REVIEW_SYSTEM_PROMPT
+
+
+def test_parse_args_force(tmp_path: Path):
+    cfg = parse_args(["a.pdf", "--force", "--out-dir", str(tmp_path)])
+    assert cfg.force is True
+    cfg2 = parse_args(["a.pdf", "--out-dir", str(tmp_path)])
+    assert cfg2.force is False
 
 
 def test_load_dotenv_if_present(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
