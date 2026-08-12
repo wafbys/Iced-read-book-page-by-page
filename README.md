@@ -4,7 +4,9 @@
 
 基于 [echohive42/AI-reads-books-page-by-page](https://github.com/echohive42/AI-reads-books-page-by-page) 改造。
 
-**要求**：Python 3.10+
+**要求**：Python 3.10+  
+
+**目标 PDF**：中文、英文或**中英混排**的学术/技术类文本 PDF（非通用多语种/扫描 OCR 工具）。抽取会跳过目录、纯参考文献表、索引等体裁页（中英线索均识别）。
 
 ## 怎么用
 
