@@ -68,6 +68,10 @@ GOLD_MAX_CHARS = 40_000
 EXTRACT_RETRY_ON_EMPTY = True
 # 审校后页码引用过稀时，可自动加一轮 max 审校
 CITE_ESCALATE_MIN = 12
+# 匹配（第 N 页）与（第 N–M 页）等范围形式（– - − — ~ 〜 至 到）
+PAGE_CITE_RE = re.compile(
+    r"第\s*\d+\s*(?:[–\-−—~〜至到]\s*\d+\s*)?页"
+)
 # auto 预读：采样页数（实质性正文页）
 PREFLIGHT_SAMPLE_TARGET = 5
 PREFLIGHT_CHARS_PER_PAGE = 2_500
@@ -1621,12 +1625,23 @@ def clean_page_text(page_text: str) -> str:
     return text
 
 
+def count_page_citations(text: str) -> int:
+    """统计文中页码类引用次数（含「第 N 页」与「第 N–M 页」）。"""
+    if not text:
+        return 0
+    return len(PAGE_CITE_RE.findall(text))
+
+
 def dedupe_knowledge(items: list[KnowledgeItem]) -> list[KnowledgeItem]:
-    seen: set[str] = set()
+    """同页同文去重；不同页的相同表述保留（页码对照需要）。"""
+    seen: set[tuple[int, str]] = set()
     out: list[KnowledgeItem] = []
     for item in items:
-        key = re.sub(r"\s+", " ", item.text).strip().lower()
-        if not key or key in seen:
+        norm = re.sub(r"\s+", " ", item.text).strip().lower()
+        if not norm:
+            continue
+        key = (int(item.page), norm)
+        if key in seen:
             continue
         seen.add(key)
         out.append(item)
@@ -2327,7 +2342,7 @@ def generate_summary(
         else:
             print(colored("⚠️  审校输出为空，回退初稿", "yellow"))
 
-        cites = len(re.findall(r"第\s*\d+\s*页", summary or ""))
+        cites = count_page_citations(summary or "")
         need = max(CITE_ESCALATE_MIN, total // 25)
         if (
             strategy.auto_escalate_review
@@ -2366,7 +2381,7 @@ def generate_summary(
             if boosted.strip():
                 summary = boosted
 
-    cites = len(re.findall(r"第\s*\d+\s*页", summary or ""))
+    cites = count_page_citations(summary or "")
     print(colored(f"✨ 总结完成（页码类引用约 {cites} 处）", "green"))
     if cites < max(CITE_ESCALATE_MIN, total // 25):
         print(
@@ -2423,7 +2438,7 @@ def save_summary(
 
     pages = sorted({i.page for i in state.knowledge if i.page > 0})
     page_range = f"{pages[0]}–{pages[-1]}" if pages else "无"
-    cite_n = len(re.findall(r"第\s*\d+\s*页", summary))
+    cite_n = count_page_citations(summary)
 
     content = f"""# 书籍分析：{config.pdf_name}
 

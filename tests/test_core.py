@@ -18,6 +18,8 @@ from read_books import (
     REVIEW_SYSTEM_PROMPT,
     chunk_items,
     compact_knowledge_index,
+    count_page_citations,
+    dedupe_knowledge,
     empty_state,
     file_sha256,
     load_dotenv_if_present,
@@ -43,6 +45,29 @@ def test_pick_preflight_pages_bounds():
     assert len(pages) == 5
     assert pages == sorted(pages)
     assert pages[0] >= 0 and pages[-1] < 100
+
+
+def test_count_page_citations_single_and_range():
+    assert count_page_citations("") == 0
+    assert count_page_citations("见（第 1 页）说明") == 1
+    assert count_page_citations("覆盖（第 12–15 页）") == 1
+    assert count_page_citations("覆盖（第 12-15 页）") == 1
+    assert count_page_citations("（第 1 页）与（第 2 页）") == 2
+    # 范围算 1 次，不要拆成残缺匹配
+    text = "论述见（第 3–5 页）与补充（第 8 页）"
+    assert count_page_citations(text) == 2
+
+
+def test_dedupe_keeps_same_text_on_different_pages():
+    items = [
+        KnowledgeItem(1, "REST 将资源映射为 URI。"),
+        KnowledgeItem(1, "REST 将资源映射为 URI。"),  # 同页重复
+        KnowledgeItem(5, "REST 将资源映射为 URI。"),  # 后文再出现，应保留
+        KnowledgeItem(5, "  REST   将资源映射为 URI。  "),  # 同页空白变体
+    ]
+    out = dedupe_knowledge(items)
+    assert len(out) == 2
+    assert {i.page for i in out} == {1, 5}
 
 
 def test_chunk_items_by_page():
