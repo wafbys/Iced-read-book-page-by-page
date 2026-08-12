@@ -40,7 +40,7 @@ env/
 Thumbs.db
 
 # Project outputs
-book_analysis/
+# book_analysis/
 
 # Local Grok session pointer (see .grok/hooks/save_session_id.py)
 .grok-session
@@ -55,3 +55,5 @@ book_analysis/
 htmlcov/
 .mypy_cache/
 .ruff_cache/
+*.pdf
+*.json
