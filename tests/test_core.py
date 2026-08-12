@@ -17,10 +17,12 @@ from read_books import (
     REVIEW_CITE_ONLY_PROMPT,
     REVIEW_SYSTEM_PROMPT,
     chunk_items,
+    compact_knowledge_index,
     empty_state,
     file_sha256,
     load_dotenv_if_present,
     load_preflight_decision,
+    normalize_knowledge_list,
     pages_complete,
     parse_args,
     parse_confirm_choice,
@@ -334,6 +336,36 @@ def test_setup_directories_blocks_overwrite_without_fingerprint(tmp_path: Path):
     assert cfg_force.pdf_path.read_bytes() == b"%PDF-source-v1"
 
 
+def test_setup_directories_never_force_overwrite_on_fingerprint_mismatch(
+    tmp_path: Path,
+):
+    """有指纹且源≠进度时，--force 也不得覆盖与进度匹配的副本。"""
+    src = tmp_path / "src"
+    out = tmp_path / "out"
+    src.mkdir()
+    out.mkdir()
+    pdf = src / "book.pdf"
+    pdf.write_bytes(b"%PDF-NEW-BOOK!!!!")
+    dest = out / "book.pdf"
+    old = b"%PDF-OLD-MATCHES-KNOWLEDGE"
+    dest.write_bytes(old)
+    knowledge = out / "book_knowledge.json"
+    knowledge.write_text(
+        json.dumps(
+            {
+                "next_page": 2,
+                "knowledge": [],
+                "meta": {"pdf_sha256": file_sha256(dest)},
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = parse_args([str(pdf), "--out-dir", str(out), "--force"])
+    with pytest.raises(SystemExit):
+        setup_directories(cfg)
+    assert dest.read_bytes() == old  # 副本未被破坏
+
+
 def test_page_content_missing_knowledge_ok():
     pc = PageContent.model_validate({"has_content": False})
     assert pc.has_content is False
@@ -403,6 +435,33 @@ def test_preflight_decision_roundtrip(tmp_path: Path):
         validate_preflight_decision(data, pdf_sha256="abc123", total_pages=99)
         is None
     )
+
+
+def test_normalize_knowledge_skips_bad_pages():
+    items = normalize_knowledge_list(
+        [
+            {"page": 1, "text": "ok item long enough"},
+            {"page": "x", "text": "bad page"},
+            {"page": 2, "text": "another ok"},
+            "plain string note",
+        ]
+    )
+    assert len(items) == 3
+    assert items[0].page == 1
+    assert items[1].page == 2
+    assert items[2].page == 0
+
+
+def test_compact_knowledge_index_includes_pages():
+    items = [
+        KnowledgeItem(1, "第一页定义 REST 与资源模型。"),
+        KnowledgeItem(1, "第一页第二条"),
+        KnowledgeItem(5, "第五页超媒体约束。"),
+    ]
+    idx = compact_knowledge_index(items)
+    assert "第 1 页" in idx
+    assert "第 5 页" in idx
+    assert "共 2 条" in idx
 
 
 def test_load_dotenv_if_present(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

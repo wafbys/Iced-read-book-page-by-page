@@ -62,6 +62,8 @@ EXTRACT_MAX_TOKENS = 4_096
 # thinking 时 reasoning 与 content 共用预算，需更大 completion 上限
 EXTRACT_MAX_TOKENS_THINKING = 16_384
 SUMMARY_MAX_TOKENS = 32_768
+# 总结/审校 content 为空时抬高 completion 预算再试
+SUMMARY_MAX_TOKENS_BUMP = 48_000
 GOLD_MAX_CHARS = 40_000
 EXTRACT_RETRY_ON_EMPTY = True
 # 审校后页码引用过稀时，可自动加一轮 max 审校
@@ -1100,8 +1102,21 @@ REVIEW_CITE_ONLY_PROMPT = """你是页码补全编辑。初稿已由**完整**�
 REVIEW_KB_FULL_CHARS = 100_000
 
 
-def _unique_sorted_pages(pages: list[int]) -> list[int]:
-    return sorted({int(p) for p in pages if int(p) > 0})
+def _safe_int(value, default: int | None = None) -> int | None:
+    """宽松转 int；失败返回 default。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _unique_sorted_pages(pages: list) -> list[int]:
+    out: set[int] = set()
+    for p in pages:
+        n = _safe_int(p)
+        if n is not None and n > 0:
+            out.add(n)
+    return sorted(out)
 
 
 def empty_state() -> KnowledgeState:
@@ -1116,38 +1131,74 @@ def empty_state() -> KnowledgeState:
 
 def normalize_knowledge_list(raw: list) -> list[KnowledgeItem]:
     items: list[KnowledgeItem] = []
+    bad = 0
     for entry in raw:
         if isinstance(entry, dict) and "text" in entry:
-            page = int(entry.get("page") or 0)
+            raw_page = entry.get("page")
+            if raw_page is None or raw_page == "":
+                page = 0
+            else:
+                page = _safe_int(raw_page)
+                if page is None:
+                    bad += 1
+                    continue
             text = str(entry["text"]).strip()
             if text:
                 items.append(KnowledgeItem(page=page, text=text))
         elif isinstance(entry, str) and entry.strip():
             items.append(KnowledgeItem(page=0, text=entry.strip()))
+        else:
+            bad += 1
+    if bad:
+        print(
+            colored(
+                f"⚠️  knowledge 中跳过 {bad} 条非法条目（page 非整数或结构异常）",
+                "yellow",
+            ),
+            file=sys.stderr,
+        )
     return items
 
 
 def load_dotenv_if_present(path: Path | None = None) -> None:
-    """可选加载 .env：不覆盖已有环境变量；无 python-dotenv 依赖。"""
-    env_path = path or Path(".env")
-    if not env_path.is_file():
-        return
-    try:
-        text = env_path.read_text(encoding="utf-8")
-    except OSError:
-        return
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
+    """可选加载 .env：不覆盖已有环境变量；依次尝试显式路径、CWD、脚本目录。"""
+    candidates: list[Path] = []
+    if path is not None:
+        candidates.append(path)
+    else:
+        candidates.append(Path(".env"))
+        try:
+            candidates.append(Path(__file__).resolve().parent / ".env")
+        except NameError:
+            pass
+    seen: set[Path] = set()
+    for env_path in candidates:
+        try:
+            resolved = env_path.resolve()
+        except OSError:
+            resolved = env_path
+        if resolved in seen:
             continue
-        key, _, value = line.partition("=")
-        key = key.strip()
-        if not key or key in os.environ:
+        seen.add(resolved)
+        if not env_path.is_file():
             continue
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-            value = value[1:-1]
-        os.environ[key] = value
+        try:
+            text = env_path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for raw in text.splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            if not key or key in os.environ:
+                continue
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            os.environ[key] = value
+        return  # 只加载找到的第一份
 
 
 def file_sha256(path: Path) -> str:
@@ -1198,8 +1249,9 @@ def parse_args(argv: list[str] | None = None) -> Config:
         "--force",
         action="store_true",
         help=(
-            "允许：无指纹进度时覆盖 PDF 副本；"
-            "抽取未完成时切换与进度不一致的抽取模型"
+            "允许：无指纹的旧进度继续（将补写指纹）；"
+            "抽取未完成时切换不一致的抽取模型。"
+            "不能用于同名换书——请删除 knowledge 后重跑"
         ),
     )
     parser.add_argument(
@@ -1350,24 +1402,27 @@ def setup_directories(config: Config) -> None:
         meta = _load_knowledge_meta(config.knowledge_path)
         stored_sha = meta.get("pdf_sha256")
         if stored_sha:
-            if source_sha != stored_sha and not config.force:
+            # 有指纹且源≠进度：禁止覆盖（--force 也不行，否则会毁掉匹配副本后校验失败）
+            if source_sha != stored_sha:
                 raise SystemExit(
-                    "❌ 源 PDF 内容与进度文件中的指纹不一致（可能同名换书）。\n"
+                    "❌ 源 PDF 与进度指纹不一致（可能同名换书）。\n"
                     f"   进度：{config.knowledge_path}\n"
                     f"   源 PDF：{config.pdf_source}\n"
-                    "   若确认是新书：删除 knowledge JSON 后重跑；\n"
-                    "   若仍是同一本书：请恢复原 PDF。\n"
-                    "   强制覆盖（危险）：加 --force"
+                    f"   副本：  {config.pdf_path}（仍保留，未覆盖）\n"
+                    "   新书：删除 knowledge JSON 与 _preflight.json 后重跑；\n"
+                    "   同书：请恢复与进度匹配的 PDF。\n"
+                    "   说明：--force 不能用于换书（会先毁掉正确副本再失败）。"
                 )
-        elif not config.force:
-            # 旧进度无指纹：禁止静默用新内容覆盖副本
+            # source == stored 但 dest 不同：用源刷新副本
+        elif source_sha != dest_sha and not config.force:
+            # 旧进度无指纹：禁止静默用不同内容覆盖副本
             raise SystemExit(
                 "❌ 已有进度但缺少 PDF 指纹，拒绝用不同内容的源文件覆盖副本。\n"
                 f"   进度：{config.knowledge_path}\n"
                 f"   源 PDF：{config.pdf_source}\n"
                 f"   副本：  {config.pdf_path}\n"
-                "   处理：删除 knowledge 后按新书重抽；\n"
-                "   或确认源与当前书一致后加 --force（将写入新指纹）。"
+                "   新书：删除 knowledge 后重抽；\n"
+                "   确认源与当前书一致：加 --force（将覆盖副本并在保存时写入指纹）。"
             )
 
     shutil.copy2(config.pdf_source, config.pdf_path)
@@ -1843,6 +1898,21 @@ def _extract_once(
     return PageContent.model_validate(json.loads(raw))
 
 
+def _drop_page_from_skips(pages: list[int], pdf_page: int) -> list[int]:
+    return [p for p in pages if int(p) != int(pdf_page)]
+
+
+def parse_failed_page_indices(
+    state: KnowledgeState, total_pages: int
+) -> list[int]:
+    """返回仍落在全书范围内的解析失败页（0-based），供重访。"""
+    out: list[int] = []
+    for p in _unique_sorted_pages(state.skipped_parse):
+        if 1 <= p <= total_pages:
+            out.append(p - 1)
+    return out
+
+
 def process_page(
     client: OpenAI,
     config: Config,
@@ -1853,10 +1923,30 @@ def process_page(
     toc: list[tuple[int, str, int]],
     pdf_document: pymupdf.Document,
     strategy: PipelineStrategy,
+    *,
+    preserve_next_page: bool = False,
 ) -> KnowledgeState:
+    """
+    处理单页抽取。
+
+    preserve_next_page=True：重访已跳过页时使用，不推进 next_page，
+    并先清除该页旧的 skip 标记以便重新分类。
+    """
     pdf_page = page_num + 1
-    next_state_page = page_num + 1
-    print(colored(f"\n📖 第 {pdf_page}/{total_pages} 页…", "yellow"))
+    if preserve_next_page:
+        next_state_page = state.next_page
+        label = f"🔁 重访第 {pdf_page}/{total_pages} 页（曾解析失败）…"
+        skipped_blank = _drop_page_from_skips(state.skipped_blank, pdf_page)
+        skipped_model = _drop_page_from_skips(state.skipped_model, pdf_page)
+        skipped_parse = _drop_page_from_skips(state.skipped_parse, pdf_page)
+    else:
+        next_state_page = page_num + 1
+        label = f"\n📖 第 {pdf_page}/{total_pages} 页…"
+        skipped_blank = list(state.skipped_blank)
+        skipped_model = list(state.skipped_model)
+        skipped_parse = list(state.skipped_parse)
+
+    print(colored(label, "yellow"))
 
     cleaned = clean_page_text(page_text)
     if is_blank_page(cleaned):
@@ -1864,9 +1954,9 @@ def process_page(
         state = KnowledgeState(
             knowledge=state.knowledge,
             next_page=next_state_page,
-            skipped_blank=state.skipped_blank + [pdf_page],
-            skipped_model=state.skipped_model,
-            skipped_parse=state.skipped_parse,
+            skipped_blank=_unique_sorted_pages(skipped_blank + [pdf_page]),
+            skipped_model=skipped_model,
+            skipped_parse=skipped_parse,
         )
         save_knowledge_state(
             config, state, strategy, pdf_page_count=total_pages
@@ -1909,9 +1999,9 @@ def process_page(
             state = KnowledgeState(
                 knowledge=state.knowledge,
                 next_page=next_state_page,
-                skipped_blank=state.skipped_blank,
-                skipped_model=state.skipped_model,
-                skipped_parse=state.skipped_parse + [pdf_page],
+                skipped_blank=skipped_blank,
+                skipped_model=skipped_model,
+                skipped_parse=_unique_sorted_pages(skipped_parse + [pdf_page]),
             )
             save_knowledge_state(
                 config, state, strategy, pdf_page_count=total_pages
@@ -1928,24 +2018,77 @@ def process_page(
         knowledge = dedupe_knowledge(state.knowledge + new_items)
         added = len(knowledge) - before
         print(colored(f"✅ +{added} 条（本页候选 {len(new_items)}）", "green"))
-        skipped_model = state.skipped_model
         if added == 0:
-            skipped_model = state.skipped_model + [pdf_page]
+            skipped_model = _unique_sorted_pages(skipped_model + [pdf_page])
     else:
         print(colored("⏭️  无有效内容", "yellow"))
         knowledge = state.knowledge
-        skipped_model = state.skipped_model + [pdf_page]
+        skipped_model = _unique_sorted_pages(skipped_model + [pdf_page])
 
     state = KnowledgeState(
         knowledge=knowledge,
         next_page=next_state_page,
-        skipped_blank=state.skipped_blank,
+        skipped_blank=skipped_blank,
         skipped_model=skipped_model,
-        skipped_parse=state.skipped_parse,
+        skipped_parse=skipped_parse,
     )
     save_knowledge_state(
         config, state, strategy, pdf_page_count=total_pages
     )
+    return state
+
+
+def retry_skipped_parse_pages(
+    client: OpenAI,
+    config: Config,
+    state: KnowledgeState,
+    total_pages: int,
+    toc: list[tuple[int, str, int]],
+    pdf_document: pymupdf.Document,
+    strategy: PipelineStrategy,
+) -> KnowledgeState:
+    """
+    对本轮仍记录在 skipped_parse 中的页再抽一次。
+    每页每进程最多再试一轮（调用方每 run 调一次即可）。
+    """
+    indices = parse_failed_page_indices(state, total_pages)
+    if not indices:
+        return state
+
+    print(
+        colored(
+            f"\n🔁 重访解析失败页 {len(indices)} 个："
+            f"{[i + 1 for i in indices]} …",
+            "cyan",
+        )
+    )
+    for page_num in indices:
+        # 仍在列表中才重试（前序重访可能已清掉）
+        if (page_num + 1) not in set(state.skipped_parse):
+            continue
+        page_text = pdf_document[page_num].get_text()
+        state = process_page(
+            client,
+            config,
+            page_text,
+            state,
+            page_num,
+            total_pages,
+            toc,
+            pdf_document,
+            strategy,
+            preserve_next_page=True,
+        )
+    still = parse_failed_page_indices(state, total_pages)
+    if still:
+        print(
+            colored(
+                f"   · 仍失败 {len(still)} 页：{[i + 1 for i in still]}",
+                "yellow",
+            )
+        )
+    else:
+        print(colored("   · 解析失败页已全部重访成功或改判", "green"))
     return state
 
 
@@ -2011,10 +2154,13 @@ def _chat_summary_model(
 
     completion = chat_create_with_retry(client, **kwargs)
     content = completion.choices[0].message.content or ""
+    nudge = "\n\n请直接给出完整最终答案正文，确保 content 非空。"
     if not content.strip() and use_thinking:
+        bumped = max(max_tokens, SUMMARY_MAX_TOKENS_BUMP)
         print(
             colored(
-                "⚠️  模型 content 为空（thinking 可能占满 max_tokens），重试一次…",
+                "⚠️  模型 content 为空（thinking 可能占满 max_tokens），"
+                f"提高预算至 {bumped} 并降 effort 重试…",
                 "yellow",
             )
         )
@@ -2023,19 +2169,16 @@ def _chat_summary_model(
             model=strategy.summary_model,
             messages=[
                 {"role": "system", "content": system},
-                {
-                    "role": "user",
-                    "content": user
-                    + "\n\n请直接给出完整最终答案正文，确保 content 非空。",
-                },
+                {"role": "user", "content": user + nudge},
             ],
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=bumped,
             reasoning_effort="high",
             extra_body=EXTRA_BODY_THINKING,
         )
         content = completion.choices[0].message.content or ""
     if not content.strip() and use_thinking:
+        bumped = max(max_tokens, SUMMARY_MAX_TOKENS_BUMP)
         print(
             colored(
                 "⚠️  仍为空，关闭 thinking 再生成…",
@@ -2047,14 +2190,10 @@ def _chat_summary_model(
             model=strategy.summary_model,
             messages=[
                 {"role": "system", "content": system},
-                {
-                    "role": "user",
-                    "content": user
-                    + "\n\n请直接给出完整最终答案正文，确保 content 非空。",
-                },
+                {"role": "user", "content": user + nudge},
             ],
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=bumped,
             extra_body=EXTRA_BODY_NO_THINKING,
         )
         content = completion.choices[0].message.content or ""
@@ -2068,6 +2207,42 @@ def format_toc_hint(toc: list[tuple[int, str, int]] | None) -> str:
     for level, title, page in toc:
         indent = "  " * max(0, level - 1)
         lines.append(f"{indent}- {title}（第 {page} 页）")
+    return "\n".join(lines) + "\n\n"
+
+
+def compact_knowledge_index(
+    knowledge: list[KnowledgeItem],
+    *,
+    max_chars: int = 12_000,
+    head_per_page: int = 100,
+) -> str:
+    """
+    紧凑页→要点索引，供多块合并终稿时补全「中间稿未覆盖」的线索。
+    每页取首条截断 + 条数；超长则截断索引本身。
+    """
+    if not knowledge:
+        return ""
+    by_page: dict[int, list[str]] = {}
+    for item in knowledge:
+        if item.page <= 0:
+            continue
+        by_page.setdefault(item.page, []).append(item.text)
+    lines = [
+        "【知识点页索引】（合并时请对照查漏；事实以中间稿与页码为准，勿编造）"
+    ]
+    size = len(lines[0])
+    for p in sorted(by_page):
+        texts = by_page[p]
+        head = re.sub(r"\s+", " ", texts[0]).strip()
+        if len(head) > head_per_page:
+            head = head[: head_per_page - 1] + "…"
+        extra = f"（共 {len(texts)} 条）" if len(texts) > 1 else ""
+        line = f"- 第 {p} 页：{head}{extra}"
+        if size + len(line) + 1 > max_chars:
+            lines.append(f"- …索引已截断，其余页码：{sorted(by_page.keys())}")
+            break
+        lines.append(line)
+        size += len(line) + 1
     return "\n".join(lines) + "\n\n"
 
 
@@ -2173,11 +2348,13 @@ def generate_summary(
         span = (
             f"{min(all_pages)}–{max(all_pages)}" if all_pages else "未知"
         )
+        kb_index = compact_knowledge_index(knowledge)
         user = (
-            f"{toc_hint}{gold_hint}"
+            f"{toc_hint}{gold_hint}{kb_index}"
             f"{len(partials)} 段中间稿；原始 {total} 条；页码跨度约 {span}。\n"
             f"合并为完整终稿：导读 + 分题详述 + 主题索引；"
-            f"去重、统一术语、前中后覆盖、页码勿编造。\n\n"
+            f"去重、统一术语、前中后覆盖、页码勿编造；"
+            f"若中间稿遗漏索引中的重要页主题，请据索引线索补全（勿编造细节）。\n\n"
             + "\n\n---\n\n".join(merged_parts)
         )
         draft = _chat_summary_model(
@@ -2262,11 +2439,18 @@ def generate_summary(
                 escalate_extra += " 知识点仍为抽样：禁止删除初稿实质内容。"
             else:
                 escalate_extra += " 并对照完整知识点查漏。"
+            # 以当前审校稿为初稿，保留第一轮结构/术语修订
+            escalate_user = (
+                f"{toc_hint}{gold_hint}"
+                f"## 初稿\n\n{summary}\n\n"
+                f"## 原始知识点\n\n{kb_blob}\n"
+                f"{escalate_extra}"
+            )
             boosted = _chat_summary_model(
                 client,
                 strategy,
                 review_system,
-                review_user + escalate_extra,
+                escalate_user,
                 reasoning_effort="max",
             )
             if boosted.strip():
@@ -2336,8 +2520,7 @@ def save_summary(
 - 生成时间：{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
 - 策略：{strategy.name} — {strategy.description}
 - 抽取模型：{strategy.extract_model}{"（thinking）" if strategy.extract_thinking else ""}
-- 总结模型：{strategy.summary_model}（{"thinking " + strategy.final_effort if strategy.summary_thinking else "no-thinking"}
-  {("+ 审校 " + strategy.review_effort) if strategy.do_review else ""}）
+- 总结模型：{strategy.summary_model}（{"thinking " + strategy.final_effort if strategy.summary_thinking else "no-thinking"}{("；审校 " + strategy.review_effort) if strategy.do_review else ""}）
 - 覆盖 PDF 页码：{page_range}
 - 知识点条数：{len(state.knowledge)}
 - 页码类引用（约）：{cite_n} 处
@@ -2698,6 +2881,17 @@ PDF：    {config.pdf_source}
                         "green",
                     )
                 )
+
+            # 解析失败页：每轮运行再访一次（不推进 next_page）
+            state = retry_skipped_parse_pages(
+                client,
+                config,
+                state,
+                total_pages,
+                toc,
+                pdf_document,
+                strategy,
+            )
 
             if not pages_complete(state, total_pages):
                 print(colored("⚠️  进度异常，未完成抽取", "yellow"), file=sys.stderr)
