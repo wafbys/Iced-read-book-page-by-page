@@ -170,10 +170,13 @@ PREFLIGHT_SYSTEM = """你是文档难度评估器。根据抽样页正文，判�
 - difficulty 3：一般学术/技术书 → 抽 Flash；总结 Pro high；要审校
 - difficulty 4：高密度术语、译著别扭、跨页论证多 → 可考虑 Pro 抽页；总结 max；要审校
 - difficulty 5：极难/高噪声/强形式化 → Pro 抽+thinking；总结与审校 max
-- need_pro_extract：仅当 Flash 明显可能漏定义/搞砸术语时为 true
-- need_extract_thinking：仅当极难且值得为每页多花钱时为 true（通常 false）
-- text_noise 高不等于一定要 Pro 抽，但应提高 summary/review effort
+- need_pro_extract：仅当 Flash 明显可能漏定义/搞砸术语时为 true（易书请 false）
+- need_extract_thinking：仅 difficulty 5 且值得每页多花钱时为 true（通常 false；
+  代码侧仅在 difficulty≥5 时才会开启抽页 thinking）
+- text_noise / term_density 高：应提高 summary/review effort，不等于一定要 Pro 抽
 - 不要因为「看起来重要」就一律 max；按样本难度诚实评估
+
+说明：下游还有确定性映射与硬闸（会覆盖不安全的 true），请仍按样本诚实打分。
 """
 
 
@@ -263,70 +266,145 @@ def _tune_chunk_size(
     return chunk
 
 
+def _norm_effort(value: str | None) -> str:
+    v = (value or "").strip().lower()
+    return v if v in ("high", "max") else "high"
+
+
+def _bump_effort(current: str, minimum: str) -> str:
+    """effort 只升不降：high < max。"""
+    order = {"high": 0, "max": 1}
+    return current if order.get(current, 0) >= order.get(minimum, 0) else minimum
+
+
 def strategy_from_assessment(
     assessment: PreflightAssessment,
     *,
     total_pages: int | None = None,
-) -> PipelineStrategy:
-    """把预读评分映射为流水线参数。"""
-    # 总结侧：至少 Pro（auto 档不为省钱而降到 Flash 总结，除非 difficulty=1）
-    if assessment.difficulty <= 1 and assessment.text_noise <= 2:
+) -> tuple[PipelineStrategy, list[str]]:
+    """
+    把预读评分映射为流水线参数（确定性规则 + 成本硬闸）。
+
+    返回 (strategy, overrides)：overrides 为人读说明，列出相对评估的强制调整。
+    """
+    overrides: list[str] = []
+    d = assessment.difficulty
+    noise = assessment.text_noise
+    terms = assessment.term_density
+    struct = assessment.structure_complexity
+
+    # —— 抽页模型 ——
+    # 基准：评估 need_pro 或 difficulty≥4
+    want_pro = bool(assessment.need_pro_extract) or d >= 4
+    if d <= 2 and assessment.need_pro_extract:
+        want_pro = False
+        overrides.append(
+            "need_pro_extract=true 但 difficulty≤2 → 强制 Flash 抽页（成本硬闸）"
+        )
+    # 术语极密且已达中等难度：即使模型未要 Pro，也升抽页
+    if not want_pro and d >= 3 and terms >= 5:
+        want_pro = True
+        overrides.append(
+            "term_density≥5 且 difficulty≥3 → 升级 Pro 抽页"
+        )
+    extract_model = MODEL_PRO if want_pro else MODEL_FLASH
+
+    # 抽页 thinking：仅 difficulty≥5 且 Pro 才允许（忽略过宽的 true）
+    want_think = bool(assessment.need_extract_thinking)
+    if want_think and extract_model != MODEL_PRO:
+        want_think = False
+        overrides.append(
+            "need_extract_thinking=true 但抽页非 Pro → 忽略 thinking"
+        )
+    if want_think and d < 5:
+        want_think = False
+        overrides.append(
+            f"need_extract_thinking=true 但 difficulty={d}<5 → 关闭抽页 thinking（成本硬闸）"
+        )
+    # 极难且模型未要 thinking：不自动强开（避免默认账单爆炸）；quality 档另说
+    extract_thinking = want_think and extract_model == MODEL_PRO and d >= 5
+
+    # —— 总结侧 ——
+    easy = d <= 1 and noise <= 2
+    if easy:
         summary_model = MODEL_FLASH
         do_review = False
         auto_esc = False
+        summary_thinking = False
     else:
         summary_model = MODEL_PRO
-        do_review = assessment.do_review if assessment.difficulty >= 2 else False
-        auto_esc = assessment.difficulty >= 3
+        do_review = bool(assessment.do_review) if d >= 2 else False
+        auto_esc = d >= 3
+        summary_thinking = True
 
-    extract_model = (
-        MODEL_PRO if assessment.need_pro_extract or assessment.difficulty >= 4 else MODEL_FLASH
-    )
-    extract_thinking = bool(
-        assessment.need_extract_thinking and extract_model == MODEL_PRO
-    )
+    final_effort = _norm_effort(assessment.summary_effort)
+    review_effort = _norm_effort(assessment.review_effort)
 
-    final_effort = assessment.summary_effort if assessment.summary_effort in (
-        "high",
-        "max",
-    ) else "high"
-    review_effort = assessment.review_effort if assessment.review_effort in (
-        "high",
-        "max",
-    ) else "high"
-    if assessment.difficulty >= 5:
+    # 噪声：提高 effort / 强制审校（与预读 prompt 对齐）
+    if noise >= 4:
+        if not do_review:
+            do_review = True
+            overrides.append("text_noise≥4 → 强制开启审校")
+        if noise >= 5:
+            prev_f, prev_r = final_effort, review_effort
+            final_effort = _bump_effort(final_effort, "max")
+            review_effort = _bump_effort(review_effort, "max")
+            if (prev_f, prev_r) != (final_effort, review_effort):
+                overrides.append(
+                    "text_noise≥5 → summary/review effort 升至 max"
+                )
+        else:
+            # noise=4：至少 high（已是），保持；若评估给了莫名其妙的值已 norm
+            pass
+
+    # 术语密度：难一点的书抬总结强度
+    if terms >= 4 and d >= 3:
+        prev = final_effort
+        final_effort = _bump_effort(final_effort, "max")
+        if final_effort != prev:
+            overrides.append(
+                "term_density≥4 且 difficulty≥3 → summary effort max"
+            )
+
+    # difficulty 阶梯强制
+    if d >= 5:
+        if final_effort != "max" or review_effort != "max" or not do_review:
+            overrides.append(
+                "difficulty≥5 → summary/review max 且强制审校"
+            )
         final_effort = "max"
         review_effort = "max"
         do_review = True
         auto_esc = True
+    elif d >= 3:
+        if not do_review:
+            do_review = True
+            overrides.append("difficulty≥3 → 强制开启审校")
+        elif not assessment.do_review:
+            overrides.append(
+                "评估 do_review=false 但 difficulty≥3 → 强制开启审校"
+            )
 
-    # 与模型建议对齐：难书强制审校
-    if assessment.difficulty >= 3:
-        do_review = True
-
+    # 结构复杂 → 略小分块
     chunk = 100_000
-    if assessment.structure_complexity >= 4:
-        chunk = 90_000  # 略小块，消化更细
+    if struct >= 4:
+        chunk = 90_000
     if total_pages and total_pages <= 40:
         chunk = max(chunk, 140_000)
-
     chunk = _tune_chunk_size(chunk, total_pages=total_pages, knowledge_chars=None)
 
     rationale = (assessment.rationale or "").strip()
     desc = (
-        f"预读评估 difficulty={assessment.difficulty} "
-        f"noise={assessment.text_noise} terms={assessment.term_density} "
-        f"struct={assessment.structure_complexity}"
+        f"预读评估 difficulty={d} "
+        f"noise={noise} terms={terms} "
+        f"struct={struct}"
     )
     if rationale:
         desc += f"；{rationale}"
+    if overrides:
+        desc += f"；映射调整×{len(overrides)}"
 
-    # 极简书可用非 thinking 总结以省钱；其余 auto 保持 thinking
-    summary_thinking = not (
-        assessment.difficulty <= 1 and assessment.text_noise <= 2
-    )
-
-    return PipelineStrategy(
+    strategy = PipelineStrategy(
         name="auto",
         extract_model=extract_model,
         summary_model=summary_model,
@@ -340,6 +418,38 @@ def strategy_from_assessment(
         summary_chunk_chars=chunk,
         description=desc,
         summary_thinking=summary_thinking,
+    )
+    return strategy, overrides
+
+
+def log_assessment_mapping(
+    assessment: PreflightAssessment,
+    strategy: PipelineStrategy,
+    overrides: list[str],
+) -> None:
+    """打印评估原值与映射后生效策略，便于对照成本。"""
+    print(
+        colored(
+            f"   · 评估原值：diff={assessment.difficulty} "
+            f"noise={assessment.text_noise} terms={assessment.term_density} "
+            f"struct={assessment.structure_complexity} | "
+            f"need_pro={assessment.need_pro_extract} "
+            f"need_think={assessment.need_extract_thinking} "
+            f"sum={assessment.summary_effort} rev={assessment.review_effort} "
+            f"do_review={assessment.do_review}",
+            "cyan",
+        )
+    )
+    if overrides:
+        for line in overrides:
+            print(colored(f"   · 映射调整：{line}", "yellow"))
+    else:
+        print(colored("   · 映射调整：无（评估与规则一致）", "cyan"))
+    print(
+        colored(
+            f"   · 生效策略：{strategy.label()}",
+            "cyan",
+        )
     )
 
 
@@ -1000,6 +1110,8 @@ def save_knowledge_state(
     strategy: PipelineStrategy | None = None,
     *,
     pdf_page_count: int | None = None,
+    preflight_assessment: PreflightAssessment | dict | None = None,
+    mapping_overrides: list[str] | None = None,
 ) -> None:
     print(
         colored(
@@ -1031,6 +1143,8 @@ def save_knowledge_state(
         "model_summary",
         "strategy",
         "strategy_spec",
+        "preflight_assessment",
+        "mapping_overrides",
     ):
         if key in prev_meta:
             meta[key] = prev_meta[key]
@@ -1052,6 +1166,13 @@ def save_knowledge_state(
                 "strategy_spec": strategy.to_spec(),
             }
         )
+    if preflight_assessment is not None:
+        if isinstance(preflight_assessment, PreflightAssessment):
+            meta["preflight_assessment"] = preflight_assessment.model_dump()
+        elif isinstance(preflight_assessment, dict):
+            meta["preflight_assessment"] = preflight_assessment
+    if mapping_overrides is not None:
+        meta["mapping_overrides"] = list(mapping_overrides)
     payload = {
         "knowledge": [item.to_dict() for item in state.knowledge],
         "next_page": state.next_page,
@@ -2087,6 +2208,8 @@ PDF：    {config.pdf_source}
         # —— 策略：auto 优先复用进度中的决议；固定档按请求解析 ——
         profile = config.profile_name.strip().lower()
         kb_chars = sum(len(i.text) for i in state.knowledge) or None
+        fresh_assessment: PreflightAssessment | None = None
+        fresh_overrides: list[str] = []
         if profile == "auto":
             # 有合法 auto strategy_spec 即复用（含 next_page==0 首页中断后续跑）
             can_reuse = (
@@ -2115,7 +2238,7 @@ PDF：    {config.pdf_source}
                     total_pages=total_pages,
                     has_toc=bool(toc),
                 )
-                strategy = strategy_from_assessment(
+                strategy, map_overrides = strategy_from_assessment(
                     assessment, total_pages=total_pages
                 )
                 strategy = resolve_strategy(
@@ -2124,6 +2247,9 @@ PDF：    {config.pdf_source}
                     knowledge_chars=kb_chars,
                     prebuilt=strategy,
                 )
+                log_assessment_mapping(assessment, strategy, map_overrides)
+                fresh_assessment = assessment
+                fresh_overrides = map_overrides
         else:
             strategy = resolve_strategy(
                 config.profile_name,
@@ -2162,10 +2288,14 @@ PDF：    {config.pdf_source}
         print(colored(f"⚙️  生效策略：{strategy.label()}", "cyan"))
         print(colored(f"   {strategy.description}", "cyan"))
 
-        # 尽早写入指纹与 strategy_spec，便于中断后续跑
-        save_knowledge_state(
-            config, state, strategy, pdf_page_count=total_pages
-        )
+        # 尽早写入指纹与 strategy_spec（及预读快照），便于中断后续跑
+        save_kwargs: dict = {
+            "pdf_page_count": total_pages,
+        }
+        if fresh_assessment is not None:
+            save_kwargs["preflight_assessment"] = fresh_assessment
+            save_kwargs["mapping_overrides"] = fresh_overrides
+        save_knowledge_state(config, state, strategy, **save_kwargs)
 
         try:
             if not extract_done:

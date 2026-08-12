@@ -61,15 +61,20 @@ python read_books.py your_book.pdf --force
 
 | 档位 | 行为 |
 |------|------|
-| **auto**（默认） | 预读约 5 页 → 评估难度 → 动态选抽页/总结强度；决议写入进度，续跑复用 |
+| **auto**（默认） | 预读约 5 页 → 评估 → **确定性映射 + 成本硬闸** → 写入进度；续跑复用 |
 | **economy** | 固定：全 Flash，无审校，**总结关闭 thinking** |
 | **balanced** | 固定：Flash 抽 + Pro 结/审 high；页码稀可升 max 再审 |
 | **quality** | 固定：Pro 抽+thinking；结/审 max |
 
-**auto 评估维度（简）**：难度、文本噪声、术语密度、结构复杂度 → 是否 Pro 抽页、总结 high/max、是否审校等。
+**auto 机制（简）**：
+
+1. 抽样页（约 5%/20%/40%/65%/85%）→ Flash 预读打分  
+2. 代码映射为流水线（非模型直接选模型 ID）  
+3. **硬闸**：`difficulty≤2` 禁止 Pro 抽页；抽页 thinking **仅** `difficulty≥5` 且 Pro  
+4. **信号入规则**：`text_noise≥4` 强制审校（≥5 还升 max effort）；`term_density≥5` 且 diff≥3 可升 Pro 抽；`term_density≥4` 且 diff≥3 升 summary max  
+5. 日志打印「评估原值 / 映射调整 / 生效策略」；`meta.preflight_assessment` 与 `mapping_overrides` 写入 knowledge  
 
 **其它自动微调**：分块随页数/知识量变化；审校后页码过稀时可再 max 审一轮。
-
 ## 产出
 
 ```

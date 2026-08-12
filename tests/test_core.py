@@ -91,23 +91,112 @@ def test_economy_disables_summary_thinking():
     assert _base_profiles()["quality"].extract_thinking is True
 
 
-def test_strategy_from_assessment_easy_book():
-    a = PreflightAssessment(
-        difficulty=1,
-        text_noise=1,
-        term_density=1,
-        structure_complexity=1,
+def _assessment(**kwargs) -> PreflightAssessment:
+    base = dict(
+        difficulty=3,
+        text_noise=2,
+        term_density=2,
+        structure_complexity=2,
         need_pro_extract=False,
         need_extract_thinking=False,
         summary_effort="high",
         review_effort="high",
+        do_review=True,
+        rationale="test",
+    )
+    base.update(kwargs)
+    return PreflightAssessment(**base)
+
+
+def test_strategy_from_assessment_easy_book():
+    a = _assessment(
+        difficulty=1,
+        text_noise=1,
+        term_density=1,
+        structure_complexity=1,
         do_review=False,
         rationale="简单",
     )
-    s = strategy_from_assessment(a, total_pages=30)
+    s, ov = strategy_from_assessment(a, total_pages=30)
     assert s.name == "auto"
     assert s.summary_thinking is False
     assert s.do_review is False
+    assert s.extract_model.endswith("flash") or "flash" in s.extract_model
+
+
+def test_hard_gate_blocks_pro_on_easy_book():
+    a = _assessment(
+        difficulty=2,
+        text_noise=2,
+        need_pro_extract=True,
+        need_extract_thinking=True,
+        do_review=False,
+    )
+    s, ov = strategy_from_assessment(a)
+    assert "flash" in s.extract_model
+    assert s.extract_thinking is False
+    assert any("Flash 抽页" in x for x in ov)
+    assert any("thinking" in x for x in ov)
+
+
+def test_hard_gate_thinking_only_at_diff5():
+    a = _assessment(
+        difficulty=4,
+        need_pro_extract=True,
+        need_extract_thinking=True,
+    )
+    s, ov = strategy_from_assessment(a)
+    assert "pro" in s.extract_model
+    assert s.extract_thinking is False
+    assert any("difficulty=4<5" in x or "difficulty" in x for x in ov)
+
+    a5 = _assessment(
+        difficulty=5,
+        need_pro_extract=True,
+        need_extract_thinking=True,
+        text_noise=3,
+    )
+    s5, _ = strategy_from_assessment(a5)
+    assert s5.extract_thinking is True
+    assert s5.final_effort == "max"
+    assert s5.do_review is True
+
+
+def test_noise_forces_review_and_effort():
+    a = _assessment(
+        difficulty=2,
+        text_noise=5,
+        term_density=2,
+        need_pro_extract=False,
+        summary_effort="high",
+        review_effort="high",
+        do_review=False,
+    )
+    s, ov = strategy_from_assessment(a)
+    assert s.do_review is True
+    assert s.final_effort == "max"
+    assert s.review_effort == "max"
+    assert any("text_noise" in x for x in ov)
+
+
+def test_term_density_upgrades_extract_and_summary():
+    a = _assessment(
+        difficulty=3,
+        term_density=5,
+        need_pro_extract=False,
+        summary_effort="high",
+    )
+    s, ov = strategy_from_assessment(a)
+    assert "pro" in s.extract_model
+    assert s.final_effort == "max"
+    assert any("term_density" in x for x in ov)
+
+
+def test_diff3_forces_review_override_message():
+    a = _assessment(difficulty=3, do_review=False, text_noise=2)
+    s, ov = strategy_from_assessment(a)
+    assert s.do_review is True
+    assert any("审校" in x for x in ov)
 
 
 def test_resolve_strategy_fixed():
