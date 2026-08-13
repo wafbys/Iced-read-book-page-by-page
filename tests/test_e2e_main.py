@@ -69,9 +69,10 @@ def _fake_chat_create(*_args, **kwargs):
 
     # 总结 / 审校：返回带页码的 markdown
     return _msg(
-        "## 导读\n\n本书介绍 REST 风格。（第 1 页）\n\n"
-        "## 分题详述\n\n### 资源\n\n- URI 标识资源（第 1 页）\n\n"
-        "## 主题索引\n\n- REST：1\n"
+        "## 怎么读\n\n本书介绍 REST 风格，建议先看资源模型。\n\n"
+        "## 阅读路线\n\n### 资源\n\n"
+        "- 对照 URI 如何标识资源（第 1 页）\n\n"
+        "## 速查\n\n- REST：1\n"
     )
 
 
@@ -118,7 +119,8 @@ def test_main_auto_yes_end_to_end(tmp_path: Path, api_key_env, monkeypatch: pyte
     assert meta.get("chosen_profile") == "auto"
 
     md = summary.read_text(encoding="utf-8")
-    assert "导读" in md or "REST" in md
+    assert "阅读路线" in md or "REST" in md
+    assert "第 1 页" in md
 
 
 def test_main_second_run_skips_when_complete(

@@ -405,6 +405,17 @@ def test_review_prompts_differ_on_deletion():
     assert "删除初稿" in REVIEW_SYSTEM_PROMPT or "删除" in REVIEW_SYSTEM_PROMPT
 
 
+def test_summary_prompts_are_reading_route():
+    from read_books import FINAL_SUMMARY_PROMPT, PARTIAL_SUMMARY_PROMPT
+
+    assert "阅读路线" in FINAL_SUMMARY_PROMPT
+    assert "（第 N 页）" in FINAL_SUMMARY_PROMPT
+    assert "分题详述" not in FINAL_SUMMARY_PROMPT
+    assert "- [ ]" not in FINAL_SUMMARY_PROMPT
+    assert "（第 N 页）" in PARTIAL_SUMMARY_PROMPT
+    assert "不要" in PARTIAL_SUMMARY_PROMPT and "论证写完" in PARTIAL_SUMMARY_PROMPT
+
+
 def test_parse_args_yes(tmp_path: Path):
     cfg = parse_args(["demo.pdf", "-y", "--out-dir", str(tmp_path)])
     assert cfg.yes is True
