@@ -39,8 +39,9 @@ env/
 .DS_Store
 Thumbs.db
 
-# Project outputs
-book_analysis/
+# Project outputs（保留导读 md，忽略副本/进度/临时文件）
+book_analysis/*
+!book_analysis/*.md
 *.tmp
 
 # Local Grok session pointer (see .grok/hooks/save_session_id.py)
