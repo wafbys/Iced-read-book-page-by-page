@@ -60,3 +60,4 @@ htmlcov/
 *.pdf
 *.json
 .envrc
+.session
