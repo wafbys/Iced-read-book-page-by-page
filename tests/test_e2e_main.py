@@ -137,3 +137,93 @@ def test_main_second_run_skips_when_complete(
     # 第二次：不 patch API 也应成功退出（已完成）
     read_books.main(argv)
     assert (out / "done.md").is_file()
+
+
+def test_main_blocks_extract_when_leftover_md(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """抽取未完成但 md 已在时，必须在调用 API 前退出。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    pdf_path = tmp_path / "book.pdf"
+    _make_pdf(pdf_path, ["Leftover markdown must not trigger a paid extract."])
+    out = tmp_path / "out3"
+    out.mkdir()
+    leftover = out / "book.md"
+    leftover.write_text("# old book guide\n", encoding="utf-8")
+    argv = [str(pdf_path), "-p", "economy", "--out-dir", str(out)]
+
+    with pytest.raises(SystemExit) as ei:
+        read_books.main(argv)
+    assert ei.value.code == 1
+    assert leftover.read_text(encoding="utf-8") == "# old book guide\n"
+    assert not (out / "book_knowledge.json").exists()
+
+
+def test_main_rejects_stale_md_after_new_knowledge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """抽完但 md 早于 knowledge 且无 summary_sha256：视为旧书残留。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    pdf_path = tmp_path / "stale.pdf"
+    _make_pdf(pdf_path, ["New extract finished, leftover markdown is older."])
+    out = tmp_path / "out4"
+    out.mkdir()
+    dest_pdf = out / "stale.pdf"
+    dest_pdf.write_bytes(pdf_path.read_bytes())
+    knowledge = out / "stale_knowledge.json"
+    knowledge.write_text(
+        json.dumps(
+            {
+                "next_page": 1,
+                "knowledge": [
+                    {"page": 1, "text": "新书已抽完的一条知识点。"}
+                ],
+                "skipped": {"blank": [], "no_content": [], "parse_error": []},
+                "meta": {"pdf_sha256": read_books.file_sha256(dest_pdf)},
+            }
+        ),
+        encoding="utf-8",
+    )
+    md = out / "stale.md"
+    md.write_text("# leftover from previous book\n", encoding="utf-8")
+    os.utime(md, (1_000, 1_000))
+    os.utime(knowledge, (5_000, 5_000))
+
+    argv = [str(pdf_path), "-p", "economy", "--out-dir", str(out)]
+    with pytest.raises(SystemExit) as ei:
+        read_books.main(argv)
+    assert ei.value.code == 1
+    assert md.read_text(encoding="utf-8") == "# leftover from previous book\n"
+
+
+def test_main_preflight_api_error_is_friendly(
+    tmp_path: Path, api_key_env, monkeypatch: pytest.MonkeyPatch, capsys
+):
+    monkeypatch.chdir(tmp_path)
+    pdf_path = tmp_path / "pre.pdf"
+    _make_pdf(pdf_path, ["Preflight should use the friendly API error path."])
+    out = tmp_path / "out5"
+    argv = [str(pdf_path), "--profile", "auto", "-y", "--out-dir", str(out)]
+
+    import httpx
+
+    req = httpx.Request("POST", "https://api.deepseek.com/v1/chat/completions")
+    err = read_books.APIError(
+        "insufficient balance",
+        req,
+        body={"error": {"message": "insufficient balance"}},
+    )
+    err.status_code = 402
+
+    with patch.object(
+        read_books, "run_preflight_assessment", side_effect=err
+    ):
+        with pytest.raises(SystemExit) as ei:
+            read_books.main(argv)
+    assert ei.value.code == 1
+    captured = capsys.readouterr()
+    text = captured.err + captured.out
+    assert "402" in text or "余额" in text
+    assert "Traceback" not in text

@@ -15,8 +15,8 @@ PDF 书籍分析器 — 逐页提取知识点，生成一篇带页码的总结�
   quality  — 固定最强：Pro 抽+thinking；结/审 max
 
 未传 --profile 时可读环境变量 READ_BOOKS_PROFILE。
-auto 决议写入 knowledge.json 的 meta（strategy_spec 等）；再次运行复用，删 knowledge 可重新预读/选档。
-也可选加载项目根目录 .env（不覆盖已有环境变量）。
+auto 决议写入 knowledge.json 的 meta（strategy_spec 等）；再次运行复用，删 knowledge 与 md 可重新预读/选档。
+也可选加载项目根目录 .env（不覆盖已有非空环境变量）。
 产出：<out-dir>/<书名>.pdf | _knowledge.json | .md
 Ctrl+C 可中断并保留进度。API Key：DEEPSEEK_API_KEY。
 """
@@ -80,6 +80,9 @@ PREFLIGHT_CHARS_PER_PAGE = 2_500
 DEFAULT_OUT_DIR = "book_analysis"
 HASH_CHUNK_SIZE = 1024 * 1024
 PREFLIGHT_DECISION_VERSION = 1
+# 无 summary_sha256 的旧产物：允许 md 与 knowledge 时间戳相差这么多秒
+SUMMARY_MTIME_SLACK_SECONDS = 1.0
+RESET_PROGRESS_HINT = "删除 knowledge JSON 与总结 md"
 
 EXTRA_BODY_NO_THINKING = {"thinking": {"type": "disabled"}}
 EXTRA_BODY_THINKING = {"thinking": {"type": "enabled"}}
@@ -369,9 +372,6 @@ def strategy_from_assessment(
                 overrides.append(
                     "text_noise≥5 → summary/review effort 升至 max"
                 )
-        else:
-            # noise=4：至少 high（已是），保持；若评估给了莫名其妙的值已 norm
-            pass
 
     # 术语密度：难一点的书抬总结强度
     if terms >= 4 and d >= 3:
@@ -571,7 +571,7 @@ def confirm_auto_strategy_interactive(
     print(
         colored(
             "\n请确认策略（写入 knowledge.json，再次运行不再询问；\n"
-            "重新预读/改选：删除 knowledge JSON 后重跑）：\n"
+            f"重新预读/改选：{RESET_PROGRESS_HINT} 后重跑）：\n"
             "  [Enter]  采用上方 auto 建议\n"
             "  [1]      economy  省钱（全 Flash，无审校）\n"
             "  [2]      balanced 平衡（Flash 抽 + Pro 结/审）\n"
@@ -1100,7 +1100,7 @@ def normalize_knowledge_list(raw: list) -> list[KnowledgeItem]:
 
 
 def load_dotenv_if_present(path: Path | None = None) -> None:
-    """可选加载 .env：不覆盖已有环境变量；依次尝试显式路径、CWD、脚本目录。"""
+    """可选加载 .env：不覆盖已有非空环境变量；依次尝试显式路径、CWD、脚本目录。"""
     candidates: list[Path] = []
     if path is not None:
         candidates.append(path)
@@ -1131,7 +1131,10 @@ def load_dotenv_if_present(path: Path | None = None) -> None:
                 continue
             key, _, value = line.partition("=")
             key = key.strip()
-            if not key or key in os.environ:
+            if not key:
+                continue
+            existing = os.environ.get(key)
+            if existing is not None and existing.strip() != "":
                 continue
             value = value.strip()
             if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
@@ -1167,7 +1170,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
             f"未指定 --profile 时可读环境变量 {PROFILE_ENV}。\n"
             "输出目录默认 ./book_analysis（相对当前工作目录）；可用 --out-dir 指定。\n"
             "auto 预读后会提示确认；决议写入 knowledge.json 的 meta，"
-            "删除 knowledge 可重新预读与选择。\n"
+            f"{RESET_PROGRESS_HINT} 可重新预读与选择。\n"
         ),
     )
     parser.add_argument("pdf", help="PDF 路径或文件名")
@@ -1264,6 +1267,23 @@ def format_api_error(exc: Exception) -> str:
     return f"API 调用失败：{message}"
 
 
+def abort_on_api_error(
+    exc: Exception, state: KnowledgeState | None
+) -> None:
+    """打印友好 API 错误并退出；progress 若已有则提示可续跑。"""
+    print(colored(f"\n⚠️  {format_api_error(exc)}", "yellow"), file=sys.stderr)
+    if state is not None:
+        print(
+            colored(
+                f"进度 next_page={state.next_page}，"
+                f"知识点 {len(state.knowledge)} 条已保存。",
+                "cyan",
+            ),
+            file=sys.stderr,
+        )
+    raise SystemExit(1) from None
+
+
 def chat_create_with_retry(client: OpenAI, **kwargs):
     last_error: Exception | None = None
     for attempt in range(1, API_MAX_RETRIES + 1):
@@ -1336,7 +1356,7 @@ def setup_directories(config: Config) -> None:
                     f"   进度：{config.knowledge_path}\n"
                     f"   源 PDF：{config.pdf_source}\n"
                     f"   副本：  {config.pdf_path}（仍保留，未覆盖）\n"
-                    "   新书：删除 knowledge JSON 后重跑；\n"
+                    f"   新书：{RESET_PROGRESS_HINT} 后重跑；\n"
                     "   同书：请恢复与进度匹配的 PDF。"
                 )
             # source == stored 但 dest 不同：用源刷新副本
@@ -1346,30 +1366,39 @@ def setup_directories(config: Config) -> None:
                 f"   进度：{config.knowledge_path}\n"
                 f"   源 PDF：{config.pdf_source}\n"
                 f"   副本：  {config.pdf_path}\n"
-                "   请删除 knowledge JSON 后按当前 PDF 重跑。"
+                f"   请{RESET_PROGRESS_HINT} 后按当前 PDF 重跑。"
             )
 
     shutil.copy2(config.pdf_source, config.pdf_path)
     print(colored(f"📄 已更新 PDF 副本 → {config.pdf_path}", "green"))
 
 
-def atomic_write_json(path: Path, payload: dict) -> None:
+def _atomic_write_text(path: Path, text: str) -> None:
+    """写入 dest；中断或失败时清掉同目录临时文件。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
         prefix=path.stem + ".", suffix=".tmp", dir=str(path.parent)
     )
+    replaced = False
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False)
+            f.write(text)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_name, path)
-    except Exception:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
+        replaced = True
+    finally:
+        if not replaced:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+
+
+def atomic_write_json(path: Path, payload: dict) -> None:
+    _atomic_write_text(
+        path, json.dumps(payload, indent=2, ensure_ascii=False)
+    )
 
 
 def save_knowledge_state(
@@ -1384,6 +1413,7 @@ def save_knowledge_state(
     sample_pages: list[int] | None = None,
     proposed_strategy_label: str | None = None,
     confirmed_via: str | None = None,
+    summary_sha256: str | None = None,
 ) -> None:
     print(
         colored(
@@ -1422,6 +1452,7 @@ def save_knowledge_state(
         "proposed_strategy_label",
         "confirmed_via",
         "decision_version",
+        "summary_sha256",
     ):
         if key in prev_meta:
             meta[key] = prev_meta[key]
@@ -1452,7 +1483,14 @@ def save_knowledge_state(
         meta["mapping_overrides"] = list(mapping_overrides)
     if chosen_profile is not None:
         meta["chosen_profile"] = chosen_profile
-        meta["profile"] = chosen_profile  # 与 CLI 解耦，记录实际选用
+        meta["profile"] = chosen_profile
+    elif (
+        config.profile_name.strip().lower() == "auto"
+        and "profile" in prev_meta
+    ):
+        meta["profile"] = prev_meta["profile"]
+    if summary_sha256 is not None:
+        meta["summary_sha256"] = summary_sha256
     if sample_pages is not None:
         meta["sample_pages"] = list(sample_pages)
     if proposed_strategy_label is not None:
@@ -1506,7 +1544,7 @@ def load_knowledge_state(config: Config) -> ProgressLoad:
     if "next_page" not in data:
         print(
             colored(
-                "⚠️  旧 knowledge 无 next_page，请删除该 JSON 后重跑。",
+                f"⚠️  旧 knowledge 无 next_page，请{RESET_PROGRESS_HINT} 后重跑。",
                 "yellow",
             ),
             file=sys.stderr,
@@ -1540,9 +1578,9 @@ def load_knowledge_state(config: Config) -> ProgressLoad:
         state=KnowledgeState(
             knowledge=points,
             next_page=next_page,
-            skipped_blank=list(skipped.get("blank") or []),
-            skipped_model=list(skipped.get("no_content") or []),
-            skipped_parse=list(skipped.get("parse_error") or []),
+            skipped_blank=_unique_sorted_pages(skipped.get("blank") or []),
+            skipped_model=_unique_sorted_pages(skipped.get("no_content") or []),
+            skipped_parse=_unique_sorted_pages(skipped.get("parse_error") or []),
         ),
         meta=meta,
         stored_strategy=stored,
@@ -1566,7 +1604,7 @@ def validate_progress(
                 f"❌ 进度 next_page={state.next_page} 非法"
                 f"（合法范围 0–{total_pages}）。\n"
                 f"   文件：{config.knowledge_path}\n"
-                "   请删除 knowledge JSON 后重跑，或手工修正 next_page。",
+                f"   请{RESET_PROGRESS_HINT} 后重跑，或手工修正 next_page。",
                 "yellow",
             ),
             file=sys.stderr,
@@ -1593,7 +1631,7 @@ def validate_progress(
                     f"   PDF：  {config.pdf_path}\n"
                     f"   进度指纹：{stored_sha[:16]}…\n"
                     f"   当前指纹：{current_sha[:16]}…\n"
-                    "   处理：删除 knowledge JSON 后按新书重抽；"
+                    f"   处理：{RESET_PROGRESS_HINT} 后按新书重抽；"
                     "或恢复与进度匹配的 PDF。",
                     "yellow",
                 ),
@@ -1606,7 +1644,7 @@ def validate_progress(
                 "❌ 进度已有内容但缺少 pdf_sha256 指纹（旧版或手工 JSON）。\n"
                 f"   文件：{config.knowledge_path}\n"
                 "   无法验证 PDF 是否与抽取时一致。\n"
-                "   请删除 knowledge JSON 后按当前 PDF 重跑。",
+                f"   请{RESET_PROGRESS_HINT} 后按当前 PDF 重跑。",
                 "yellow",
             ),
             file=sys.stderr,
@@ -1624,7 +1662,7 @@ def validate_progress(
                 colored(
                     f"❌ 进度记录页数={stored_n}，当前 PDF 页数={total_pages}，不一致。\n"
                     f"   文件：{config.knowledge_path}\n"
-                    "   请删除 knowledge JSON 后重跑。",
+                    f"   请{RESET_PROGRESS_HINT} 后重跑。",
                     "yellow",
                 ),
                 file=sys.stderr,
@@ -1684,9 +1722,14 @@ def load_pdf_toc(pdf_document: pymupdf.Document) -> list[tuple[int, str, int]]:
     for entry in raw:
         if not entry or len(entry) < 3:
             continue
-        level, title, page = entry[0], str(entry[1]).strip(), int(entry[2])
+        try:
+            level = int(entry[0])
+            title = str(entry[1]).strip()
+            page = int(entry[2])
+        except (TypeError, ValueError):
+            continue
         if title and page > 0:
-            toc.append((int(level), title, page))
+            toc.append((level, title, page))
     return toc
 
 
@@ -1728,7 +1771,6 @@ def neighbor_context(
     if pdf_page <= 1 or not state.knowledge:
         return ""
 
-    # 收集前两页要点
     pages_wanted = [pdf_page - 1]
     if pdf_page > 2:
         pages_wanted.insert(0, pdf_page - 2)
@@ -1823,30 +1865,45 @@ def _extract_once(
         completion = chat_create_with_retry(client, **kwargs)
         return (completion.choices[0].message.content or "").strip()
 
-    raw = _call(thinking=use_thinking, tokens=max_tokens)
+    def _parse(text: str) -> PageContent | None:
+        stripped = (text or "").strip()
+        if not stripped:
+            return None
+        try:
+            return PageContent.model_validate(json.loads(stripped))
+        except (json.JSONDecodeError, ValidationError):
+            return None
 
-    # thinking 占满预算时常返回空 content；抬高上限再试，仍空则关 thinking
-    if not raw and use_thinking:
+    raw = _call(thinking=use_thinking, tokens=max_tokens)
+    parsed = _parse(raw)
+
+    # thinking 占满预算时常空 content 或截断 JSON；抬上限再试，仍失败则关 thinking
+    if parsed is None and use_thinking:
+        reason = "content 为空" if not raw else "JSON 无法解析"
         bumped = max(max_tokens * 2, EXTRACT_MAX_TOKENS_THINKING)
         print(
             colored(
-                "⚠️  抽页 content 为空（thinking 可能占满 max_tokens），"
+                f"⚠️  抽页 {reason}（thinking 可能占满 max_tokens），"
                 f"提高预算至 {bumped} 重试…",
                 "yellow",
             )
         )
         raw = _call(thinking=True, tokens=bumped)
-    if not raw and use_thinking:
+        parsed = _parse(raw)
+    if parsed is None and use_thinking:
         print(
             colored(
-                "⚠️  仍为空，关闭 thinking 再抽本页…",
+                "⚠️  仍失败，关闭 thinking 再抽本页…",
                 "yellow",
             )
         )
         raw = _call(thinking=False, tokens=EXTRACT_MAX_TOKENS)
+        parsed = _parse(raw)
 
-    if not raw:
-        raw = "{}"
+    if parsed is not None:
+        return parsed
+    if not (raw or "").strip():
+        return PageContent(has_content=False, knowledge=[])
     return PageContent.model_validate(json.loads(raw))
 
 
@@ -2014,9 +2071,10 @@ def retry_skipped_parse_pages(
             "cyan",
         )
     )
+    pending_skips = set(_unique_sorted_pages(state.skipped_parse))
     for page_num in indices:
         # 仍在列表中才重试（前序重访可能已清掉）
-        if (page_num + 1) not in set(state.skipped_parse):
+        if (page_num + 1) not in pending_skips:
             continue
         page_text = pdf_document[page_num].get_text()
         state = process_page(
@@ -2031,6 +2089,7 @@ def retry_skipped_parse_pages(
             strategy,
             preserve_next_page=True,
         )
+        pending_skips = set(_unique_sorted_pages(state.skipped_parse))
     still = parse_failed_page_indices(state, total_pages)
     if still:
         print(
@@ -2487,29 +2546,50 @@ def save_summary(
 *由 PDF 书籍分析器（DeepSeek）生成*
 """
     print(colored(f"\n📝 写入总结：{config.summary_path}", "cyan"))
-    # 原子写 md
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=config.summary_path.stem + ".",
-        suffix=".tmp",
-        dir=str(config.summary_path.parent),
+    _atomic_write_text(config.summary_path, content)
+    save_knowledge_state(
+        config,
+        state,
+        strategy,
+        summary_sha256=file_sha256(config.summary_path),
     )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(content)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_name, config.summary_path)
-    except Exception:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
     print(colored("✅ 已保存", "green"))
 
 
 def pages_complete(state: KnowledgeState, total_pages: int) -> bool:
     return state.next_page >= total_pages
+
+
+def blocking_summary_reason(
+    config: Config,
+    *,
+    extract_done: bool,
+    meta: dict | None = None,
+) -> str | None:
+    """现有 md 会挡住安全推进时返回原因；否则 None。"""
+    if not config.summary_path.exists():
+        return None
+    if not extract_done:
+        return (
+            f"总结文件已存在，但抽取尚未完成。\n"
+            f"   {config.summary_path}\n"
+            "   请先删除该 md 再跑，以免抽完全书后无法写入新总结。"
+        )
+    stored = (meta or {}).get("summary_sha256")
+    if isinstance(stored, str) and stored.strip():
+        return None
+    try:
+        md_mtime = config.summary_path.stat().st_mtime
+        kb_mtime = config.knowledge_path.stat().st_mtime
+    except OSError:
+        return None
+    if md_mtime + SUMMARY_MTIME_SLACK_SECONDS < kb_mtime:
+        return (
+            f"总结文件早于当前 knowledge，可能是同名旧书残留。\n"
+            f"   {config.summary_path}\n"
+            "   请删除该 md 后重跑以生成与当前抽取匹配的总结。"
+        )
+    return None
 
 
 def _graceful_interrupt(
@@ -2525,17 +2605,9 @@ def _graceful_interrupt(
         file=sys.stderr,
     )
     if state is not None and config is not None:
-        try:
-            # 再落盘一次，确保最近内存状态不丢
-            save_knowledge_state(config, state)
-        except Exception as exc:
-            print(
-                colored(f"⚠️  退出前保存进度失败：{exc}", "yellow"),
-                file=sys.stderr,
-            )
         print(
             colored(
-                f"   进度已保留：next_page={state.next_page}，"
+                f"   进度：next_page={state.next_page}，"
                 f"知识点 {len(state.knowledge)} 条\n"
                 f"   文件：{config.knowledge_path}\n"
                 f"   下次直接再跑同一命令即可续跑。",
@@ -2609,24 +2681,28 @@ PDF：    {config.pdf_source}
             print(colored("📑 无 PDF 书签（依赖邻页/下页上下文）", "yellow"))
 
         extract_done = pages_complete(state, total_pages)
-        summary_exists = config.summary_path.exists()
-
-        if extract_done and summary_exists:
+        summary_block = blocking_summary_reason(
+            config, extract_done=extract_done, meta=progress.meta
+        )
+        if extract_done and config.summary_path.exists() and summary_block is None:
             print(
                 colored(
                     f"\n✅ 已完成（抽取 {state.next_page}/{total_pages}，总结已存在）\n"
                     f"   总结：{config.summary_path}\n"
                     f"   重写总结 → 删除该 md 后再执行\n"
                     f"   人工润色 → 另存为 {config.gold_path.name} 供下次总结参考\n"
-                    f"   重抽全书 → 删除 knowledge JSON 后再执行\n"
-                    f"   重做 auto 预读/改选 → 删除 knowledge 后重跑\n"
+                    f"   重抽全书 / 同名换书 → {RESET_PROGRESS_HINT} 后再执行\n"
+                    f"   重做 auto 预读/改选 → {RESET_PROGRESS_HINT} 后重跑\n"
                     f"   换总结策略 → --profile … 且已抽完时重跑（仅 md 删后）\n"
-                    f"   换抽取模型 → 须删除 knowledge 重抽",
+                    f"   换抽取模型 → 须 {RESET_PROGRESS_HINT} 后重抽",
                     "green",
                 )
             )
             print(colored("\n✨ 跳过，已退出 ✨", "green", attrs=["bold"]))
             return
+        if summary_block is not None:
+            print(colored(f"\n⚠️  {summary_block}", "yellow"), file=sys.stderr)
+            raise SystemExit(1)
 
         client = create_client()
 
@@ -2638,7 +2714,6 @@ PDF：    {config.pdf_source}
 
         if profile == "auto":
             strategy = None
-            # 1) knowledge 已有 strategy_spec → 复用（策略与进度同一文件）
             if progress.stored_strategy is not None:
                 strategy = resolve_strategy(
                     progress.stored_strategy.name
@@ -2653,12 +2728,11 @@ PDF：    {config.pdf_source}
                     colored(
                         f"♻️  复用 knowledge 中的策略（{chosen}）\n"
                         f"   {strategy.label()}\n"
-                        f"   重新预读/改选：删除 {config.knowledge_path.name} 后重跑",
+                        f"   重新预读/改选：{RESET_PROGRESS_HINT} 后重跑",
                         "cyan",
                     )
                 )
             else:
-                # 2) 兼容旧版独立 _preflight.json
                 legacy = try_import_legacy_preflight_file(
                     config, pdf_sha256=pdf_sha, total_pages=total_pages
                 )
@@ -2686,12 +2760,20 @@ PDF：    {config.pdf_source}
                 sample_idx = pick_preflight_pages(total_pages)
                 samples = collect_preflight_samples(pdf_document, sample_idx)
                 sample_pages_1b = [p for p, _ in samples]
-                assessment = run_preflight_assessment(
-                    client,
-                    samples,
-                    total_pages=total_pages,
-                    has_toc=bool(toc),
-                )
+                try:
+                    assessment = run_preflight_assessment(
+                        client,
+                        samples,
+                        total_pages=total_pages,
+                        has_toc=bool(toc),
+                    )
+                except (
+                    APIStatusError,
+                    APIError,
+                    APIConnectionError,
+                    APITimeoutError,
+                ) as exc:
+                    abort_on_api_error(exc, state)
                 proposed, map_overrides = strategy_from_assessment(
                     assessment, total_pages=total_pages
                 )
@@ -2752,7 +2834,7 @@ PDF：    {config.pdf_source}
                     colored(
                         "❌ 进度已开始抽取，但 knowledge 中无 strategy_spec。\n"
                         f"   文件：{config.knowledge_path}\n"
-                        "   请删除 knowledge 后重抽。",
+                        f"   请{RESET_PROGRESS_HINT} 后重抽。",
                         "yellow",
                     ),
                     file=sys.stderr,
@@ -2771,7 +2853,7 @@ PDF：    {config.pdf_source}
                         f"   本次：{strategy.extract_model}"
                         f"{'+thinking' if strategy.extract_thinking else ''}\n"
                         "   继续会导致前后页混用不同模型。\n"
-                        "   处理：保持原 --profile 续跑；或删除 knowledge 后重抽。",
+                        f"   处理：保持原 --profile 续跑；或{RESET_PROGRESS_HINT} 后重抽。",
                         "yellow",
                     ),
                     file=sys.stderr,
@@ -2889,19 +2971,7 @@ PDF：    {config.pdf_source}
             save_summary(config, summary, state, strategy)
 
         except (APIStatusError, APIError, APIConnectionError, APITimeoutError) as exc:
-            print(
-                colored(f"\n⚠️  {format_api_error(exc)}", "yellow"),
-                file=sys.stderr,
-            )
-            print(
-                colored(
-                    f"进度 next_page={state.next_page}，"
-                    f"知识点 {len(state.knowledge)} 条已保存。",
-                    "cyan",
-                ),
-                file=sys.stderr,
-            )
-            raise SystemExit(1) from None
+            abort_on_api_error(exc, state)
 
         print(colored("\n✨ 处理完成 ✨", "green", attrs=["bold"]))
 

@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from read_books import (
+    EXTRACT_MAX_TOKENS_THINKING,
     KnowledgeItem,
     KnowledgeState,
     PageContent,
@@ -16,6 +20,8 @@ from read_books import (
     ProgressLoad,
     REVIEW_CITE_ONLY_PROMPT,
     REVIEW_SYSTEM_PROMPT,
+    atomic_write_json,
+    blocking_summary_reason,
     chunk_items,
     compact_knowledge_index,
     count_page_citations,
@@ -23,17 +29,22 @@ from read_books import (
     empty_state,
     file_sha256,
     load_dotenv_if_present,
+    load_knowledge_state,
+    load_pdf_toc,
     normalize_knowledge_list,
     pages_complete,
     parse_args,
     parse_confirm_choice,
     pick_preflight_pages,
     resolve_strategy,
+    save_knowledge_state,
     setup_directories,
     strategy_from_assessment,
     try_import_legacy_preflight_file,
     validate_progress,
     _base_profiles,
+    _extract_once,
+    _graceful_interrupt,
     _tune_chunk_size,
 )
 
@@ -485,8 +496,179 @@ def test_load_dotenv_if_present(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     env.write_text('FOO_TEST_KEY="from-dotenv"\n', encoding="utf-8")
     monkeypatch.delenv("FOO_TEST_KEY", raising=False)
     load_dotenv_if_present(env)
-    assert __import__("os").environ.get("FOO_TEST_KEY") == "from-dotenv"
+    assert os.environ.get("FOO_TEST_KEY") == "from-dotenv"
     monkeypatch.setenv("FOO_TEST_KEY", "already")
     env.write_text('FOO_TEST_KEY="ignored"\n', encoding="utf-8")
     load_dotenv_if_present(env)
-    assert __import__("os").environ.get("FOO_TEST_KEY") == "already"
+    assert os.environ.get("FOO_TEST_KEY") == "already"
+    monkeypatch.setenv("FOO_TEST_KEY", "")
+    env.write_text('FOO_TEST_KEY="from-dotenv"\n', encoding="utf-8")
+    load_dotenv_if_present(env)
+    assert os.environ.get("FOO_TEST_KEY") == "from-dotenv"
+
+
+def _cfg(tmp_path: Path, *, profile: str = "auto"):
+    from read_books import Config
+
+    out = tmp_path / "out"
+    out.mkdir(exist_ok=True)
+    return Config(
+        pdf_name="book.pdf",
+        pdf_source=tmp_path / "book.pdf",
+        pdf_path=out / "book.pdf",
+        knowledge_path=out / "book_knowledge.json",
+        summary_path=out / "book.md",
+        gold_path=out / "book_gold.md",
+        profile_name=profile,
+        out_dir=out,
+    )
+
+
+def test_save_keeps_chosen_profile_on_auto_incremental(tmp_path: Path):
+    cfg = _cfg(tmp_path, profile="auto")
+    state = empty_state()
+    economy = _base_profiles()["economy"]
+    save_knowledge_state(
+        cfg, state, economy, chosen_profile="economy"
+    )
+    save_knowledge_state(cfg, state, economy)
+    meta = json.loads(cfg.knowledge_path.read_text(encoding="utf-8"))["meta"]
+    assert meta["profile"] == "economy"
+    assert meta["chosen_profile"] == "economy"
+
+
+def test_load_knowledge_normalizes_string_skip_pages(tmp_path: Path):
+    cfg = _cfg(tmp_path)
+    cfg.knowledge_path.write_text(
+        json.dumps(
+            {
+                "next_page": 4,
+                "knowledge": [],
+                "skipped": {
+                    "blank": ["1"],
+                    "no_content": ["2"],
+                    "parse_error": ["3"],
+                },
+                "meta": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    progress = load_knowledge_state(cfg)
+    assert progress.state.skipped_blank == [1]
+    assert progress.state.skipped_model == [2]
+    assert progress.state.skipped_parse == [3]
+
+
+def test_load_pdf_toc_skips_malformed_entries():
+    pdf = MagicMock()
+    pdf.get_toc.return_value = [
+        [1, "Good", 3],
+        [1, "Bad page", None],
+        ["x", "Bad level", 4],
+        [2, "Also good", 8],
+        None,
+        [1, "", 2],
+    ]
+    assert load_pdf_toc(pdf) == [(1, "Good", 3), (2, "Also good", 8)]
+
+
+def test_blocking_summary_reason(tmp_path: Path):
+    cfg = _cfg(tmp_path)
+    assert blocking_summary_reason(cfg, extract_done=False) is None
+
+    cfg.summary_path.write_text("old leftover", encoding="utf-8")
+    reason = blocking_summary_reason(cfg, extract_done=False)
+    assert reason is not None and "尚未完成" in reason
+
+    cfg.knowledge_path.write_text("{}", encoding="utf-8")
+    os.utime(cfg.summary_path, (1_000, 1_000))
+    os.utime(cfg.knowledge_path, (2_000, 2_000))
+    reason = blocking_summary_reason(cfg, extract_done=True, meta={})
+    assert reason is not None and "早于" in reason
+
+    assert (
+        blocking_summary_reason(
+            cfg, extract_done=True, meta={"summary_sha256": "abc"}
+        )
+        is None
+    )
+
+    os.utime(cfg.summary_path, (3_000, 3_000))
+    os.utime(cfg.knowledge_path, (2_000, 2_000))
+    assert blocking_summary_reason(cfg, extract_done=True, meta={}) is None
+
+
+def test_graceful_interrupt_does_not_rewrite_knowledge():
+    """中断提示不得改写 knowledge，以免抬高 mtime 误判旧 md。"""
+    cfg = MagicMock()
+    cfg.knowledge_path = Path("unused.json")
+    with patch("read_books.save_knowledge_state") as save:
+        with pytest.raises(SystemExit) as ei:
+            _graceful_interrupt(cfg, empty_state(), phase="test")
+    assert ei.value.code == 130
+    save.assert_not_called()
+
+
+def test_atomic_write_json_cleans_tmp_on_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    dest = tmp_path / "x.json"
+
+    def boom(*_a, **_k):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("read_books.os.fsync", boom)
+    with pytest.raises(KeyboardInterrupt):
+        atomic_write_json(dest, {"a": 1})
+    assert list(tmp_path.glob("*.tmp")) == []
+    assert not dest.exists()
+
+
+def _completion(content: str) -> SimpleNamespace:
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
+    )
+
+
+def test_extract_once_empty_returns_no_content():
+    strategy = _base_profiles()["economy"]
+    with patch(
+        "read_books.chat_create_with_retry",
+        return_value=_completion(""),
+    ):
+        result = _extract_once(MagicMock(), "page body", strategy)
+    assert result.has_content is False
+    assert result.knowledge == []
+
+
+def test_extract_once_thinking_retries_truncated_json():
+    strategy = _base_profiles()["quality"]
+    calls: list[dict] = []
+
+    def fake_create(*_a, **kwargs):
+        calls.append(
+            {
+                "tokens": kwargs.get("max_tokens"),
+                "thinking": (kwargs.get("extra_body") or {}).get("thinking"),
+            }
+        )
+        if len(calls) < 3:
+            return _completion("{")
+        return _completion(
+            json.dumps(
+                {
+                    "has_content": True,
+                    "knowledge": ["这是一条足够长的知识点用于通过过滤。"],
+                },
+                ensure_ascii=False,
+            )
+        )
+
+    with patch("read_books.chat_create_with_retry", side_effect=fake_create):
+        result = _extract_once(MagicMock(), "page body", strategy)
+    assert result.has_content is True
+    assert len(calls) == 3
+    assert calls[0]["thinking"] == {"type": "enabled"}
+    assert calls[1]["tokens"] >= EXTRACT_MAX_TOKENS_THINKING
+    assert calls[2]["thinking"] == {"type": "disabled"}

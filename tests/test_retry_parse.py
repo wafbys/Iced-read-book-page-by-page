@@ -159,3 +159,56 @@ def test_retry_skipped_parse_pages_invokes_process():
 
     assert calls == [0, 1]
     assert out.skipped_parse == []
+
+
+def test_retry_skipped_parse_pages_accepts_string_pages():
+    strategy = _base_profiles()["economy"]
+    state = KnowledgeState(
+        knowledge=[],
+        next_page=3,
+        skipped_blank=[],
+        skipped_model=[],
+        skipped_parse=["1", "2"],
+    )
+    pdf = MagicMock()
+    pdf.__getitem__ = MagicMock(
+        side_effect=lambda i: MagicMock(get_text=lambda: "body " * 20)
+    )
+    calls: list[int] = []
+
+    def fake_process(
+        client,
+        config,
+        page_text,
+        state,
+        page_num,
+        total_pages,
+        toc,
+        pdf_document,
+        strategy,
+        *,
+        preserve_next_page=False,
+    ):
+        calls.append(page_num)
+        return KnowledgeState(
+            knowledge=state.knowledge,
+            next_page=state.next_page,
+            skipped_blank=[],
+            skipped_model=[],
+            skipped_parse=[
+                p for p in state.skipped_parse if int(p) != page_num + 1
+            ],
+        )
+
+    with patch("read_books.process_page", side_effect=fake_process):
+        retry_skipped_parse_pages(
+            MagicMock(),
+            MagicMock(),
+            state,
+            total_pages=5,
+            toc=[],
+            pdf_document=pdf,
+            strategy=strategy,
+        )
+
+    assert calls == [0, 1]

@@ -73,7 +73,7 @@ python read_books.py your_book.pdf -y
 2. 代码映射（成本硬闸 + noise/terms）  
 3. 展示报告，确认或改选 economy / balanced / quality  
 4. **决议写入 `书名_knowledge.json` 的 `meta`**（`strategy_spec` 等）  
-5. 再次运行：有策略则复用；**删除 knowledge 可重新预读/选档**  
+5. 再次运行：有策略则复用；**删除 knowledge 与总结 md 可重新预读/选档**  
 
 ## 产出（每本书）
 
@@ -85,7 +85,7 @@ book_analysis/                 # 或 --out-dir
   书名_gold.md                 # 可选人工金标准
 ```
 
-**没有单独的 preflight 文件。** 策略与进度在同一个 knowledge 里：删进度 = 可重选策略；只删 md = 只重总结。
+**没有单独的 preflight 文件。** 策略与进度在同一个 knowledge 里：删进度 = 可重选策略；只删 md = 只重总结。同名换书须同时删除 knowledge 与 md，否则旧导读会挡住新抽取。
 
 （若目录里还有旧的 `书名_preflight.json`，程序会读一次并迁入 knowledge，之后可手动删掉。）
 
@@ -93,7 +93,7 @@ book_analysis/                 # 或 --out-dir
 
 - 产出目录相对 **进程当前工作目录**，不是脚本所在目录。  
 - 进度按 PDF **文件名**区分；同名不同内容靠 **SHA-256 指纹**拦截。  
-- 指纹不一致 / 缺指纹 / 中途换抽取模型：直接拒绝 → **删 knowledge 后重跑**（无 `--force`，靠删产物重置）。  
+- 指纹不一致 / 缺指纹 / 中途换抽取模型：直接拒绝 → **删 knowledge 与总结 md 后重跑**（无 `--force`，靠删产物重置）。  
 
 ## 怎么读产物（自用）
 
@@ -126,7 +126,7 @@ book_analysis/                 # 或 --out-dir
 | 抽完 + 已有 md | **跳过** |
 | 抽完 + 无 md | 只跑总结 |
 | 重写总结 | 删 `书名.md` 再跑（可换 `--profile` 影响总结侧） |
-| 重抽 / 重选策略 | 删 `书名_knowledge.json` |
+| 重抽 / 重选策略 / 同名换书 | 删 `书名_knowledge.json` **和** `书名.md` |
 | 人工迭代 | 润色稿另存 `书名_gold.md`，删 md 再跑 |
 
 ## API Key
