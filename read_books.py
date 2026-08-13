@@ -84,6 +84,46 @@ PREFLIGHT_DECISION_VERSION = 1
 SUMMARY_MTIME_SLACK_SECONDS = 1.0
 RESET_PROGRESS_HINT = "删除 knowledge JSON 与总结 md"
 
+# 体裁硬闸：点线目录 / 索引 / 书目达到这些比例则不调用抽取 API
+_GENRE_TOC_DOT_RE = re.compile(r"[.·．…⋯]{3,}\s*\d{1,4}\s*$")
+_GENRE_PAGE_REFS_RE = re.compile(
+    r"\s+\d{1,4}(?:\s*[,;–\-−—~〜]\s*\d{1,4}){0,8}\s*$"
+)
+_GENRE_ROMAN_PAGE_RE = re.compile(r"\s+[ivxlcdm]{1,8}\s*$", re.I)
+_GENRE_CODEY_RE = re.compile(
+    r"""[=;{}<>]|::|return\s|^\s*(?:if|for|while|def|class|import)\b"""
+)
+_GENRE_TOC_HEADER_RE = re.compile(
+    r"\b(?:brief\s+contents|table of contents|contents|"
+    r"目录|目次|内容目录)\b",
+    re.I,
+)
+_GENRE_INDEX_HEADER_RE = re.compile(r"\b(?:index|索引|主题索引)\b", re.I)
+_GENRE_BIB_HEADER_RE = re.compile(
+    r"\b(?:references|bibliography|works cited|further reading|"
+    r"参考文献|参考书目)\b",
+    re.I,
+)
+_GENRE_BIB_LINE_RE = re.compile(
+    r"^(?:\d+\.|\[\d+\])\s+\S.+\b(?:1[7-9]\d{2}|20\d{2})\b"
+)
+_GENRE_BIB_START_RE = re.compile(r"^(?:\d+\.|\[\d+\])\s+\S")
+_GENRE_STANDALONE_PAGE_RE = re.compile(
+    r"^(?:\d{1,4}|[ivxlcdm]{1,8})$", re.I
+)
+_GENRE_FRONT_HEAD_RE = re.compile(
+    r"(?:about the author|about the cover|封面说明|作者简介|译者简介|"
+    r"continued from back cover|isbn-1[03]\s*:|"
+    r"acknowledgments?|致谢|鸣谢)",
+    re.I,
+)
+_GENRE_LABELS = {
+    "toc": "目录",
+    "index": "索引",
+    "references": "参考文献",
+    "front_matter": "辅文",
+}
+
 EXTRA_BODY_NO_THINKING = {"thinking": {"type": "disabled"}}
 EXTRA_BODY_THINKING = {"thinking": {"type": "enabled"}}
 
@@ -934,12 +974,14 @@ EXTRACT_SYSTEM_PROMPT = """你是顶级学术读书笔记助手。目标 PDF 为
 | 目录 | 目录、目次、章节名+页码点线 | Contents, Table of Contents, chapter titles + page numbers |
 | 参考文献 | 参考文献、参考书目、书目列表 | References, Bibliography, Works Cited, Further Reading（纯书目页） |
 | 索引 | 索引、主题索引 | Index |
+| 辅文 | 作者简介、译者简介、封面说明、封底广告 | about the author, about the cover, back-cover / ISBN blurb |
 | 其它 | 空白、版权页、纯出版信息、纯致谢名单 | blank, copyright, colophon, pure acknowledgements list |
 
 体裁判断（满足其一且整页以该体裁为主 → skip）：
-- 目录：大量「标题 …… 页码」或「Chapter/第N章 … page」行，无论证句
+- 目录：大量「标题 …… 页码」或「Chapter/第N章 … page」行，无论证句。**禁止**根据目录标题扩写定义或命题
 - 参考文献：大量「作者. 题名. 出处. 年.」或 `[n] Author…` / `Author et al., year` 书目行；或整页在 References 章下的条目堆砌
 - **不要**把正文里的简短引用当成整页文献，例如 `(Smith, 1999)`、`见文献[3]`、一句带出处的论证 → 应提取
+- 作者简介 / 封面说明 / 封底 ISBN 营销整页跳过；「关于本书 / about this book」的阅读地图仍提取
 
 若本页在目录/书目区块之外仍有实质定义、命题、论证或例子 → has_content=true 并只提取实质部分。
 拿不准且正文论证明显多于书目/目录行 → 提取，勿误杀。
@@ -976,6 +1018,7 @@ PARTIAL_SUMMARY_PROMPT = """你在做全书总结的**中间稿**（高质量优
 4. 保留关键论证链条与反例；术语沿用原文（中/英/混排专名勿乱译）
 5. 本批有什么写什么，不臆造未出现章节
 6. **忽略**纯参考文献书目式条目（作者-题名-出处罗列）；聚焦概念与论证
+7. 序言 / about this book / 作者简介等前辅文不要并入第 1 章；可在导读里一句带过
 
 只输出本节选消化正文（中文导读体；专名可中英并存）。
 """
@@ -999,6 +1042,7 @@ FINAL_SUMMARY_PROMPT = """你是技术书导读作者，目标是让读者能对
 - 术语保真（中/英/混排专名沿用原文）；宁可少写不可写错
 - 详实、可复习，避免空泛排比
 - **不要**把纯参考文献书目展开成导读主体；文献仅在论证需要时可一句带过
+- 序言、about this book、作者简介、封底等前/后辅文不要并入第 1 章标题下；对照 PDF 时页码须落在对应辅文或正文章节
 
 只输出 Markdown 正文（中文导读体；专名可中英并存）。
 """
@@ -1674,6 +1718,96 @@ def is_blank_page(page_text: str) -> bool:
     return len(page_text.strip()) < MIN_PAGE_CHARS
 
 
+def _genre_nonempty_lines(page_text: str) -> list[str]:
+    return [ln.strip() for ln in page_text.splitlines() if ln.strip()]
+
+
+def _line_looks_codey(line: str) -> bool:
+    return bool(_GENRE_CODEY_RE.search(line))
+
+
+def _line_has_leader_page(line: str) -> bool:
+    return bool(_GENRE_TOC_DOT_RE.search(line))
+
+
+def _line_ends_with_page_ref(line: str) -> bool:
+    if _line_looks_codey(line) or len(line) > 90:
+        return False
+    return bool(
+        _GENRE_PAGE_REFS_RE.search(line) or _GENRE_ROMAN_PAGE_RE.search(line)
+    )
+
+
+def detect_skip_genre(page_text: str) -> str | None:
+    """正文页返回 None；目录/索引/书目/辅文返回体裁键。"""
+    lines = _genre_nonempty_lines(page_text)
+    n = len(lines)
+    if n < 4:
+        if any(_GENRE_FRONT_HEAD_RE.search(ln) for ln in lines[:6]):
+            return "front_matter"
+        return None
+    head = "\n".join(lines[:12])
+
+    dotted = sum(1 for ln in lines if _line_has_leader_page(ln))
+    if dotted >= 6 and dotted / n >= 0.70:
+        return "toc"
+
+    page_ref_lines = sum(1 for ln in lines if _line_ends_with_page_ref(ln))
+    standalone_pages = sum(
+        1 for ln in lines if _GENRE_STANDALONE_PAGE_RE.match(ln)
+    )
+    short_lines = sum(1 for ln in lines if len(ln) <= 40)
+    toc_head = bool(_GENRE_TOC_HEADER_RE.search(head))
+    if toc_head and page_ref_lines >= 8 and page_ref_lines / n >= 0.35:
+        return "toc"
+    # 英文目录常被拆成「标题 / ■ / 页码」各占一行
+    if (
+        toc_head
+        and n >= 20
+        and standalone_pages >= 8
+        and short_lines / n >= 0.70
+    ):
+        return "toc"
+
+    index_hits = sum(
+        1
+        for ln in lines
+        if _GENRE_PAGE_REFS_RE.search(ln)
+        and not _line_looks_codey(ln)
+        and 8 <= len(ln) <= 90
+    )
+    if index_hits >= 15 and index_hits / n >= 0.50:
+        return "index"
+    if (
+        _GENRE_INDEX_HEADER_RE.search(head)
+        and index_hits >= 10
+        and index_hits / n >= 0.40
+    ):
+        return "index"
+
+    bib_hits = sum(1 for ln in lines if _GENRE_BIB_LINE_RE.search(ln))
+    bib_starts = sum(1 for ln in lines if _GENRE_BIB_START_RE.match(ln))
+    if bib_hits >= 6 and bib_hits / n >= 0.40:
+        return "references"
+    if (
+        _GENRE_BIB_HEADER_RE.search("\n".join(lines[:4]))
+        and bib_starts >= 2
+        and (bib_starts / n >= 0.12 or n <= 10)
+    ):
+        return "references"
+    if (
+        _GENRE_BIB_HEADER_RE.search(head)
+        and bib_hits >= 4
+        and bib_hits / n >= 0.20
+    ):
+        return "references"
+
+    # 只看页首标题，避免目录条目里的「about the author」误伤
+    if any(_GENRE_FRONT_HEAD_RE.search(ln) for ln in lines[:6]):
+        return "front_matter"
+    return None
+
+
 def clean_page_text(page_text: str) -> str:
     text = page_text.replace("\x00", " ")
     text = re.sub(r"[ \t]+\n", "\n", text)
@@ -1965,6 +2099,22 @@ def process_page(
             next_page=next_state_page,
             skipped_blank=_unique_sorted_pages(skipped_blank + [pdf_page]),
             skipped_model=skipped_model,
+            skipped_parse=skipped_parse,
+        )
+        save_knowledge_state(
+            config, state, strategy, pdf_page_count=total_pages
+        )
+        return state
+
+    genre = detect_skip_genre(cleaned)
+    if genre is not None:
+        label_zh = _GENRE_LABELS.get(genre, genre)
+        print(colored(f"⏭️  体裁页（{label_zh}），跳过", "yellow"))
+        state = KnowledgeState(
+            knowledge=state.knowledge,
+            next_page=next_state_page,
+            skipped_blank=skipped_blank,
+            skipped_model=_unique_sorted_pages(skipped_model + [pdf_page]),
             skipped_parse=skipped_parse,
         )
         save_knowledge_state(
@@ -2488,7 +2638,7 @@ def format_skip_meta(state: KnowledgeState) -> str:
         )
     if state.skipped_model:
         parts.append(
-            f"模型跳过 {len(state.skipped_model)} 页："
+            f"无抽取 {len(state.skipped_model)} 页："
             f"{_unique_sorted_pages(state.skipped_model)}"
         )
     if state.skipped_parse:

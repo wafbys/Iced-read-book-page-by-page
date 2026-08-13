@@ -26,6 +26,7 @@ from read_books import (
     compact_knowledge_index,
     count_page_citations,
     dedupe_knowledge,
+    detect_skip_genre,
     empty_state,
     file_sha256,
     load_dotenv_if_present,
@@ -46,6 +47,7 @@ from read_books import (
     _extract_once,
     _graceful_interrupt,
     _tune_chunk_size,
+    process_page,
 )
 
 
@@ -672,3 +674,90 @@ def test_extract_once_thinking_retries_truncated_json():
     assert calls[0]["thinking"] == {"type": "enabled"}
     assert calls[1]["tokens"] >= EXTRACT_MAX_TOKENS_THINKING
     assert calls[2]["thinking"] == {"type": "disabled"}
+
+
+def test_detect_skip_genre_dotted_toc():
+    lines = [
+        f"第{i} 章 标题{i}" + "." * 40 + f"{20 + i}" for i in range(1, 12)
+    ]
+    assert detect_skip_genre("\n".join(lines)) == "toc"
+
+
+def test_detect_skip_genre_split_english_contents():
+    parts = ["v", "contents", "preface", "ix", "acknowledgments", "xi"]
+    for i in range(1, 12):
+        parts.extend([str(i), "■", f"Chapter title {i}", str(i * 10)])
+    assert detect_skip_genre("\n".join(parts)) == "toc"
+
+
+def test_detect_skip_genre_does_not_treat_narrative_toc_metaphor():
+    text = (
+        "26\nCHAPTER 2\nNarrative code\n"
+        "Table of contents as a narrative level is an overview of a very complex story.\n"
+        "Actions are the simplest narrative elements. They represent small, individual "
+        "steps such as executing a query or sending a message. Extract methods so that "
+        "each action holds a single chunk the reader can keep in working memory.\n"
+        "Chapters orchestrate several scenes to complete a business goal."
+    )
+    assert detect_skip_genre(text) is None
+
+
+def test_detect_skip_genre_index_and_references():
+    index_lines = [f"term{i} about something {i+20}" for i in range(20)]
+    assert detect_skip_genre("index\n" + "\n".join(index_lines)) == "index"
+    refs = ["参考文献 75", "参考文献"]
+    for i in range(1, 8):
+        refs.append(
+            f"{i}. A. Author. Some paper title here. Journal, {1990 + i}."
+        )
+    assert detect_skip_genre("\n".join(refs)) == "references"
+
+
+def test_detect_skip_genre_front_matter_not_about_this_book():
+    author = (
+        "xvii\nabout the author\n"
+        "SANDRINE BANAS is a senior Java expert with over 25 years of experience.\n"
+        "She speaks at Devoxx and other conferences."
+    )
+    assert detect_skip_genre(author) == "front_matter"
+    back = (
+        "ISBN-13: 978-1-63343-492-9\n"
+        "Software development is an inherently creative activity, and yet we "
+        "regularly reduce it to the formulaic or mechanical."
+    )
+    assert detect_skip_genre(back) == "front_matter"
+    about_book = (
+        "xiii\nabout this book\n"
+        "The Art of Code is a book for developers who aspire to create software "
+        "that is both beautiful and enduring. In an era where AI is reshaping "
+        "programming, it refocuses attention on skills, creativity, and beauty.\n"
+        "Chapter 1 establishes the rosette model of eight quality dimensions.\n"
+        "Chapter 2 treats programs as stories with five fundamental plots."
+    )
+    assert detect_skip_genre(about_book) is None
+
+
+def test_process_page_skips_toc_without_api():
+    strategy = _base_profiles()["economy"]
+    config = MagicMock()
+    state = empty_state()
+    toc_text = "\n".join(
+        f"第{i} 章 主题{i}" + "." * 36 + f"{10 + i}" for i in range(1, 12)
+    )
+    with patch("read_books._extract_once") as extract, patch(
+        "read_books.save_knowledge_state"
+    ):
+        new_state = process_page(
+            MagicMock(),
+            config,
+            toc_text,
+            state,
+            page_num=3,
+            total_pages=20,
+            toc=[],
+            pdf_document=MagicMock(),
+            strategy=strategy,
+        )
+    extract.assert_not_called()
+    assert 4 in new_state.skipped_model
+    assert new_state.knowledge == []
