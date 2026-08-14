@@ -5,17 +5,18 @@ PDF 书籍分析器 — 逐页提取知识点，生成可打印的带页码精�
 
 用法：
   python read_books.py book.pdf
-  python read_books.py book.pdf --profile auto|economy|balanced|quality
+  python read_books.py book.pdf --profile economy|suggest|balanced|quality
   python read_books.py book.pdf --out-dir ./out
-  python read_books.py book.pdf -y          # 跳过 auto 交互确认
+  python read_books.py book.pdf -y          # suggest 下跳过交互确认
 
-  auto     — 预读评估 → 展示结果 → 确认或改选档位（默认）
-  economy  — 固定省钱：全 Flash，无审校，总结关 thinking
+  economy  — 固定省钱：全 Flash，无审校，总结关 thinking（默认）
+  suggest  — 预读评估 → 展示结果 → 确认或改选档位
   balanced — 固定平衡：Flash 抽 + Pro 结/审 high
   quality  — 固定最强：Pro 抽+thinking；结/审 max
 
 未传 --profile 时可读环境变量 READ_BOOKS_PROFILE。
-auto 决议写入 knowledge.json 的 meta（strategy_spec 等）；再次运行复用，删 knowledge 与 md 可重新预读/选档。
+suggest 决议写入 knowledge.json 的 meta（strategy_spec 等）；再次运行复用，删 knowledge 与 md 可重新预读/选档。
+--profile auto 仍可用，等同 suggest。
 也可选加载项目根目录 .env（不覆盖已有非空环境变量）。
 产出：<out-dir>/<书名>.pdf | _knowledge.json | .md
 Ctrl+C 可中断并保留进度。API Key：DEEPSEEK_API_KEY。
@@ -128,9 +129,33 @@ EXTRA_BODY_NO_THINKING = {"thinking": {"type": "disabled"}}
 EXTRA_BODY_THINKING = {"thinking": {"type": "enabled"}}
 
 PROFILE_ENV = "READ_BOOKS_PROFILE"
-VALID_PROFILES = ("auto", "economy", "balanced", "quality")
-# 交互确认时可改选的固定档（不含 auto 本身；Enter 表示采用 auto 映射）
+VALID_PROFILES = ("economy", "suggest", "balanced", "quality")
+DEFAULT_PROFILE = "economy"
+# 旧名：auto = suggest
+PROFILE_ALIASES = {"auto": "suggest"}
+# 交互确认时可改选的固定档（不含 suggest 本身；Enter 表示采用预读映射）
 CONFIRM_PROFILE_CHOICES = ("economy", "balanced", "quality")
+
+
+def canonicalize_profile(raw: str | None) -> str | None:
+    """规范化档位名；auto → suggest；非法返回 None。"""
+    if raw is None:
+        return None
+    s = str(raw).strip().lower()
+    if not s:
+        return None
+    s = PROFILE_ALIASES.get(s, s)
+    return s if s in VALID_PROFILES else None
+
+
+def _profile_arg(value: str) -> str:
+    got = canonicalize_profile(value)
+    if got is None:
+        raise argparse.ArgumentTypeError(
+            f"无效档位 {value!r}，可选：{', '.join(VALID_PROFILES)}"
+            "（auto 等同 suggest）"
+        )
+    return got
 
 
 @dataclass(frozen=True)
@@ -286,9 +311,9 @@ def _base_profiles() -> dict[str, PipelineStrategy]:
             description="固定最强：Pro 抽+thinking；结/审 max",
             summary_thinking=True,
         ),
-        # auto 占位；真正参数由预读评估填充
-        "auto": PipelineStrategy(
-            name="auto",
+        # suggest 占位；真正参数由预读评估填充
+        "suggest": PipelineStrategy(
+            name="suggest",
             extract_model=MODEL_FLASH,
             summary_model=MODEL_PRO,
             extract_thinking=False,
@@ -461,7 +486,7 @@ def strategy_from_assessment(
         desc += f"；映射调整×{len(overrides)}"
 
     strategy = PipelineStrategy(
-        name="auto",
+        name="suggest",
         extract_model=extract_model,
         summary_model=summary_model,
         extract_thinking=extract_thinking,
@@ -518,9 +543,9 @@ def print_auto_analysis_report(
     overrides: list[str],
     has_toc: bool,
 ) -> None:
-    """向用户展示 auto 预读分析结论（确认前）。"""
+    """向用户展示 suggest 预读分析结论（确认前）。"""
     print(colored("\n" + "═" * 56, "cyan"))
-    print(colored("📊 auto 预读分析报告", "cyan", attrs=["bold"]))
+    print(colored("📊 suggest 预读分析报告", "cyan", attrs=["bold"]))
     print(colored("═" * 56, "cyan"))
     print(colored(f"  全书页数：{total_pages}　书签：{'有' if has_toc else '无'}", "cyan"))
     pages_s = ", ".join(str(p) for p in sample_pages) if sample_pages else "（无实质正文样本）"
@@ -560,11 +585,11 @@ def print_auto_analysis_report(
 def parse_confirm_choice(raw: str) -> str | None:
     """
     解析用户确认输入。
-    返回：'auto' | 'economy' | 'balanced' | 'quality' | 'quit'；无效则 None。
+    返回：'suggest' | 'economy' | 'balanced' | 'quality' | 'quit'；无效则 None。
     """
     s = (raw or "").strip().lower()
-    if s in ("", "a", "auto", "y", "yes", "是", "确认"):
-        return "auto"
+    if s in ("", "a", "auto", "s", "suggest", "y", "yes", "是", "确认"):
+        return "suggest"
     if s in ("1", "e", "economy", "省钱"):
         return "economy"
     if s in ("2", "b", "balanced", "平衡"):
@@ -584,35 +609,35 @@ def confirm_auto_strategy_interactive(
     yes: bool,
 ) -> str:
     """
-    让用户确认 auto 建议或改选固定档。
-    返回 chosen_profile：'auto' | 'economy' | 'balanced' | 'quality'。
+    让用户确认 suggest 建议或改选固定档。
+    返回 chosen_profile：'suggest' | 'economy' | 'balanced' | 'quality'。
     用户退出时 SystemExit(0)。
     """
     if yes:
         print(
             colored(
-                "✓ 已指定 --yes：采用 auto 映射策略，跳过确认。",
+                "✓ 已指定 --yes：采用 suggest 映射策略，跳过确认。",
                 "green",
             )
         )
-        return "auto"
+        return "suggest"
 
     if not sys.stdin.isatty():
         print(
             colored(
-                "✓ 非交互终端：采用 auto 映射策略（可用 -y 明示；"
+                "✓ 非交互终端：采用 suggest 映射策略（可用 -y 明示；"
                 "要改档请用 --profile）。",
                 "yellow",
             ),
             file=sys.stderr,
         )
-        return "auto"
+        return "suggest"
 
     print(
         colored(
             "\n请确认策略（写入 knowledge.json，再次运行不再询问；\n"
             f"重新预读/改选：{RESET_PROGRESS_HINT} 后重跑）：\n"
-            "  [Enter]  采用上方 auto 建议\n"
+            "  [Enter]  采用上方 suggest 建议\n"
             "  [1]      economy  省钱（全 Flash，无审校）\n"
             "  [2]      balanced 平衡（Flash 抽 + Pro 结/审）\n"
             "  [3]      quality  最强（Pro 抽+thinking）\n"
@@ -625,17 +650,17 @@ def confirm_auto_strategy_interactive(
             raw = input(colored("你的选择 > ", "cyan"))
         except EOFError:
             print(
-                colored("未读到输入，采用 auto 映射策略。", "yellow"),
+                colored("未读到输入，采用 suggest 映射策略。", "yellow"),
                 file=sys.stderr,
             )
-            return "auto"
+            return "suggest"
         choice = parse_confirm_choice(raw)
         if choice == "quit":
             print(colored("已取消。", "yellow"))
             raise SystemExit(0)
-        if choice in ("auto",) + CONFIRM_PROFILE_CHOICES:
-            if choice == "auto":
-                print(colored(f"✓ 采用 auto 建议：{proposed.label()}", "green"))
+        if choice in ("suggest",) + CONFIRM_PROFILE_CHOICES:
+            if choice == "suggest":
+                print(colored(f"✓ 采用 suggest 建议：{proposed.label()}", "green"))
             else:
                 print(colored(f"✓ 改选固定档：{choice}", "green"))
             return choice
@@ -701,28 +726,32 @@ def resolve_strategy(
     """
     解析策略：
     - 固定档 economy/balanced/quality
-    - auto 须先预读得到 prebuilt，否则暂回 balanced 骨架再评估
+    - suggest 须先预读得到 prebuilt，否则暂回 balanced 骨架再评估
     - 再按页数/知识量微调分块
     """
     profiles = _base_profiles()
-    raw = (profile_name or os.environ.get(PROFILE_ENV) or "auto").strip().lower()
-    if raw not in VALID_PROFILES:
+    raw = canonicalize_profile(profile_name)
+    if raw is None:
+        raw = canonicalize_profile(os.environ.get(PROFILE_ENV))
+    if raw is None and (profile_name or os.environ.get(PROFILE_ENV)):
         print(
             colored(
-                f"⚠️  未知 {PROFILE_ENV}={raw!r}，回退 auto。"
+                f"⚠️  未知档位 {profile_name or os.environ.get(PROFILE_ENV)!r}，"
+                f"回退 {DEFAULT_PROFILE}。"
                 f"可选：{', '.join(VALID_PROFILES)}",
                 "yellow",
             ),
             file=sys.stderr,
         )
-        raw = "auto"
+    if raw is None:
+        raw = DEFAULT_PROFILE
 
-    if prebuilt is not None and raw == "auto":
+    if prebuilt is not None and raw == "suggest":
         base = prebuilt
-    elif raw == "auto":
+    elif raw == "suggest":
         base = profiles["balanced"].with_updates(
-            name="auto",
-            description="auto（待预读评估）",
+            name="suggest",
+            description="suggest（待预读评估）",
         )
     else:
         base = profiles[raw]
@@ -925,7 +954,7 @@ class Config:
     gold_path: Path
     profile_name: str
     out_dir: Path
-    yes: bool = False  # 跳过 auto 交互确认，直接采用映射策略
+    yes: bool = False  # suggest 下跳过交互确认，直接采用映射策略
 
 
 @dataclass
@@ -1214,24 +1243,25 @@ def parse_args(argv: list[str] | None = None) -> Config:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "策略说明：\n"
-            "  auto      预读若干页后评估，动态选 Flash/Pro 与 high/max（默认）\n"
-            "  economy   固定省钱：全 Flash，无审校\n"
+            "  economy   固定省钱：全 Flash，无审校（默认）\n"
+            "  suggest   预读若干页后评估，动态选 Flash/Pro 与 high/max\n"
             "  balanced  固定平衡：Flash 抽 + Pro 结/审 high\n"
             "  quality   固定最强：Pro 抽+thinking；结/审 max\n"
             f"未指定 --profile 时可读环境变量 {PROFILE_ENV}。\n"
             "输出目录默认 ./book_analysis（相对当前工作目录）；可用 --out-dir 指定。\n"
-            "auto 预读后会提示确认；决议写入 knowledge.json 的 meta，"
+            "suggest 预读后会提示确认；决议写入 knowledge.json 的 meta，"
             f"{RESET_PROGRESS_HINT} 可重新预读与选择。\n"
+            "--profile auto 等同 suggest。\n"
         ),
     )
     parser.add_argument("pdf", help="PDF 路径或文件名")
     parser.add_argument(
         "--profile",
         "-p",
-        choices=VALID_PROFILES,
+        type=_profile_arg,
         default=None,
-        help="流水线策略档（默认 auto；也可用环境变量 "
-        f"{PROFILE_ENV}）",
+        help="流水线策略档（默认 economy；也可用环境变量 "
+        f"{PROFILE_ENV}；auto 等同 suggest）",
     )
     parser.add_argument(
         "--out-dir",
@@ -1242,7 +1272,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         "--yes",
         "-y",
         action="store_true",
-        help="auto 模式下跳过交互确认，直接采用预读映射策略",
+        help="suggest 模式下跳过交互确认，直接采用预读映射策略",
     )
     args = parser.parse_args(argv)
 
@@ -1250,20 +1280,22 @@ def parse_args(argv: list[str] | None = None) -> Config:
     if source.suffix.lower() != ".pdf":
         parser.error("文件必须是 .pdf")
 
-    # 优先级：--profile > 环境变量 > auto
+    # 优先级：--profile > 环境变量 > economy
     if args.profile:
         profile = args.profile
     else:
-        profile = (os.environ.get(PROFILE_ENV) or "auto").strip().lower()
-        if profile not in VALID_PROFILES:
+        profile = canonicalize_profile(os.environ.get(PROFILE_ENV))
+        if os.environ.get(PROFILE_ENV) and profile is None:
             print(
                 colored(
-                    f"⚠️  环境变量 {PROFILE_ENV}={profile!r} 无效，回退 auto",
+                    f"⚠️  环境变量 {PROFILE_ENV}="
+                    f"{os.environ.get(PROFILE_ENV)!r} 无效，回退 {DEFAULT_PROFILE}",
                     "yellow",
                 ),
                 file=sys.stderr,
             )
-            profile = "auto"
+        if profile is None:
+            profile = DEFAULT_PROFILE
 
     out_dir = Path(args.out_dir)
     pdf_name = source.name
@@ -1536,7 +1568,7 @@ def save_knowledge_state(
         meta["chosen_profile"] = chosen_profile
         meta["profile"] = chosen_profile
     elif (
-        config.profile_name.strip().lower() == "auto"
+        canonicalize_profile(config.profile_name) == "suggest"
         and "profile" in prev_meta
     ):
         meta["profile"] = prev_meta["profile"]
@@ -2695,7 +2727,7 @@ def save_summary(
 {format_skip_meta(state)}
 - 说明：页码为 PDF 阅读器页码（从 1 起）。适合打印后对着原文用笔标注。重写请先删除本文件再运行。
 - 可选金标准：同目录 `{config.gold_path.name}`
-- 策略：`--profile auto|economy|balanced|quality`（或环境变量 `{PROFILE_ENV}`）
+- 策略：`--profile economy|suggest|balanced|quality`（或环境变量 `{PROFILE_ENV}`）
 
 {summary.strip()}
 
@@ -2801,7 +2833,7 @@ PDF：    {config.pdf_source}
 进度：   {config.knowledge_path}
 总结：   {config.summary_path}
 金标准： {config.gold_path}（可选）
-切换：   --profile auto|economy|balanced|quality
+切换：   --profile economy|suggest|balanced|quality
 提示：   Ctrl+C 可中断；策略在 knowledge 中，删之可重选
 """,
                 "cyan",
@@ -2849,7 +2881,7 @@ PDF：    {config.pdf_source}
                     f"   重写总结 → 删除该 md 后再执行\n"
                     f"   人工润色 → 另存为 {config.gold_path.name} 供下次总结参考\n"
                     f"   重抽全书 / 同名换书 → {RESET_PROGRESS_HINT} 后再执行\n"
-                    f"   重做 auto 预读/改选 → {RESET_PROGRESS_HINT} 后重跑\n"
+                    f"   重做 suggest 预读/改选 → {RESET_PROGRESS_HINT} 后重跑\n"
                     f"   换总结策略 → --profile … 且已抽完时重跑（仅 md 删后）\n"
                     f"   换抽取模型 → 须 {RESET_PROGRESS_HINT} 后重抽",
                     "green",
@@ -2863,19 +2895,21 @@ PDF：    {config.pdf_source}
 
         client = create_client()
 
-        # —— 策略：auto 读 knowledge.meta / 预读确认；固定档直接解析 ——
-        profile = config.profile_name.strip().lower()
+        # —— 策略：suggest 读 knowledge.meta / 预读确认；固定档直接解析 ——
+        profile = canonicalize_profile(config.profile_name) or DEFAULT_PROFILE
         kb_chars = sum(len(i.text) for i in state.knowledge) or None
         decision_extra: dict = {}
         pdf_sha = file_sha256(config.pdf_path)
 
-        if profile == "auto":
+        if profile == "suggest":
             strategy = None
             if progress.stored_strategy is not None:
+                stored_name = (
+                    canonicalize_profile(progress.stored_strategy.name)
+                    or "suggest"
+                )
                 strategy = resolve_strategy(
-                    progress.stored_strategy.name
-                    if progress.stored_strategy.name in VALID_PROFILES
-                    else "auto",
+                    stored_name,
                     total_pages=total_pages,
                     knowledge_chars=kb_chars,
                     prebuilt=progress.stored_strategy,
@@ -2896,7 +2930,7 @@ PDF：    {config.pdf_source}
                 if legacy is not None:
                     strategy, leg = legacy
                     strategy = resolve_strategy(
-                        strategy.name if strategy.name in VALID_PROFILES else "auto",
+                        canonicalize_profile(strategy.name) or "suggest",
                         total_pages=total_pages,
                         knowledge_chars=kb_chars,
                         prebuilt=strategy,
@@ -2935,7 +2969,7 @@ PDF：    {config.pdf_source}
                     assessment, total_pages=total_pages
                 )
                 proposed = resolve_strategy(
-                    "auto",
+                    "suggest",
                     total_pages=total_pages,
                     knowledge_chars=kb_chars,
                     prebuilt=proposed,
@@ -2954,7 +2988,7 @@ PDF：    {config.pdf_source}
                     proposed=proposed,
                     yes=config.yes,
                 )
-                if chosen_profile == "auto":
+                if chosen_profile == "suggest":
                     strategy = proposed
                     confirmed_via = (
                         "yes_flag"
@@ -3021,7 +3055,7 @@ PDF：    {config.pdf_source}
         print(colored(f"⚙️  生效策略：{strategy.label()}", "cyan"))
         print(colored(f"   {strategy.description}", "cyan"))
 
-        # 尽早写入指纹与 strategy_spec（及 auto 决议），便于中断后续跑
+        # 尽早写入指纹与 strategy_spec（及 suggest 决议），便于中断后续跑
         save_kwargs: dict = {"pdf_page_count": total_pages}
         save_kwargs.update(
             {k: v for k, v in decision_extra.items() if v is not None}

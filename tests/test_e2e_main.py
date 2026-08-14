@@ -1,4 +1,4 @@
-"""mock API 的端到端冒烟：auto -y → 抽页 → 总结。"""
+"""mock API 的端到端冒烟：suggest -y → 抽页 → 总结。"""
 
 from __future__ import annotations
 
@@ -95,7 +95,7 @@ def test_main_auto_yes_end_to_end(tmp_path: Path, api_key_env, monkeypatch: pyte
     argv = [
         str(pdf_path),
         "--profile",
-        "auto",
+        "suggest",
         "--yes",
         "--out-dir",
         str(out),
@@ -116,7 +116,7 @@ def test_main_auto_yes_end_to_end(tmp_path: Path, api_key_env, monkeypatch: pyte
     assert len(data.get("knowledge") or []) >= 1
     meta = data.get("meta") or {}
     assert "strategy_spec" in meta
-    assert meta.get("chosen_profile") == "auto"
+    assert meta.get("chosen_profile") == "suggest"
 
     md = summary.read_text(encoding="utf-8")
     assert "阅读路线" in md or "REST" in md
@@ -207,7 +207,7 @@ def test_main_preflight_api_error_is_friendly(
     pdf_path = tmp_path / "pre.pdf"
     _make_pdf(pdf_path, ["Preflight should use the friendly API error path."])
     out = tmp_path / "out5"
-    argv = [str(pdf_path), "--profile", "auto", "-y", "--out-dir", str(out)]
+    argv = [str(pdf_path), "--profile", "suggest", "-y", "--out-dir", str(out)]
 
     import httpx
 

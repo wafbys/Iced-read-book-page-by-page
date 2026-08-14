@@ -160,7 +160,7 @@ def test_strategy_from_assessment_easy_book():
         rationale="简单",
     )
     s, ov = strategy_from_assessment(a, total_pages=30)
-    assert s.name == "auto"
+    assert s.name == "suggest"
     assert s.summary_thinking is False
     assert s.do_review is False
     assert s.extract_model.endswith("flash") or "flash" in s.extract_model
@@ -255,6 +255,16 @@ def test_tune_chunk_size():
 def test_parse_args_out_dir(tmp_path: Path):
     cfg = parse_args(["demo.pdf", "-p", "balanced", "--out-dir", str(tmp_path)])
     assert cfg.profile_name == "balanced"
+
+
+def test_parse_args_default_is_economy(tmp_path: Path):
+    cfg = parse_args(["demo.pdf", "--out-dir", str(tmp_path)])
+    assert cfg.profile_name == "economy"
+
+
+def test_parse_args_auto_alias_is_suggest(tmp_path: Path):
+    cfg = parse_args(["demo.pdf", "-p", "auto", "--out-dir", str(tmp_path)])
+    assert cfg.profile_name == "suggest"
     assert cfg.out_dir == tmp_path
     assert cfg.knowledge_path == tmp_path / "demo_knowledge.json"
     assert cfg.summary_path == tmp_path / "demo.md"
@@ -423,8 +433,9 @@ def test_parse_args_yes(tmp_path: Path):
 
 
 def test_parse_confirm_choice():
-    assert parse_confirm_choice("") == "auto"
-    assert parse_confirm_choice("yes") == "auto"
+    assert parse_confirm_choice("") == "suggest"
+    assert parse_confirm_choice("yes") == "suggest"
+    assert parse_confirm_choice("auto") == "suggest"
     assert parse_confirm_choice("1") == "economy"
     assert parse_confirm_choice("2") == "balanced"
     assert parse_confirm_choice("3") == "quality"
@@ -459,7 +470,7 @@ def test_legacy_preflight_file_import(tmp_path: Path):
         knowledge_path=out / "book_knowledge.json",
         summary_path=out / "book.md",
         gold_path=out / "book_gold.md",
-        profile_name="auto",
+        profile_name="suggest",
         out_dir=out,
     )
     got = try_import_legacy_preflight_file(
@@ -520,7 +531,7 @@ def test_load_dotenv_if_present(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     assert os.environ.get("FOO_TEST_KEY") == "from-dotenv"
 
 
-def _cfg(tmp_path: Path, *, profile: str = "auto"):
+def _cfg(tmp_path: Path, *, profile: str = "suggest"):
     from read_books import Config
 
     out = tmp_path / "out"
@@ -538,7 +549,7 @@ def _cfg(tmp_path: Path, *, profile: str = "auto"):
 
 
 def test_save_keeps_chosen_profile_on_auto_incremental(tmp_path: Path):
-    cfg = _cfg(tmp_path, profile="auto")
+    cfg = _cfg(tmp_path, profile="suggest")
     state = empty_state()
     economy = _base_profiles()["economy"]
     save_knowledge_state(

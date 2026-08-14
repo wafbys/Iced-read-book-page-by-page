@@ -1,6 +1,6 @@
 # PDF Book Analyzer
 
-逐页提取知识点并生成带页码的精读地图（适合打印后对着原文划）。默认 **auto**：预读抽样 → 分析报告 → 确认或改选档位。
+逐页提取知识点并生成带页码的精读地图（适合打印后对着原文划）。默认 **economy**（全 Flash）。要预读建议并确认，用 `--profile suggest`。
 
 基于 [echohive42/AI-reads-books-page-by-page](https://github.com/echohive42/AI-reads-books-page-by-page) 改造。
 
@@ -34,27 +34,29 @@ set DEEPSEEK_API_KEY=sk-...
 也可在项目根目录（或当前目录）放 `.env`（参考 `.env.example`）。启动时可选加载，**不覆盖**已有环境变量。
 
 ```bash
-# 默认 auto（预读 → 确认）
+# 默认 economy（全 Flash，无预读确认）
 python read_books.py your_book.pdf
 
+# 预读评估 → 确认或改选
+python read_books.py your_book.pdf --profile suggest
+
 # 固定档（无交互确认）
-python read_books.py your_book.pdf --profile economy
 python read_books.py your_book.pdf --profile balanced
 python read_books.py your_book.pdf --profile quality
 
 # 指定产出目录（默认 ./book_analysis，相对当前工作目录）
 python read_books.py your_book.pdf --out-dir ./my_out
 
-# auto 跳过确认，直接采用预读映射（脚本/CI）
-python read_books.py your_book.pdf -y
+# suggest 跳过确认，直接采用预读映射（脚本/CI）
+python read_books.py your_book.pdf --profile suggest -y
 ```
 
 | 参数 | 说明 |
 |------|------|
 | `pdf` | PDF 路径或文件名（必填） |
-| `--profile` / `-p` | `auto` \| `economy` \| `balanced` \| `quality`（默认 `auto`） |
+| `--profile` / `-p` | `economy` \| `suggest` \| `balanced` \| `quality`（默认 `economy`；`auto` 等同 `suggest`） |
 | `--out-dir` | 产出目录（默认 `book_analysis`，相对 **当前工作目录**） |
-| `--yes` / `-y` | auto 模式跳过确认，直接采用预读映射策略 |
+| `--yes` / `-y` | suggest 模式跳过确认，直接采用预读映射策略 |
 
 未传 `--profile` 时，可读环境变量 `READ_BOOKS_PROFILE`。
 
@@ -62,12 +64,12 @@ python read_books.py your_book.pdf -y
 
 | 档位 | 行为 |
 |------|------|
-| **auto**（默认） | 预读 → 展示分析 → **确认或改选** → 策略写入 knowledge；续跑复用 |
-| **economy** | 固定：全 Flash，无审校，总结关闭 thinking |
+| **economy**（默认） | 固定：全 Flash，无审校，总结关闭 thinking |
+| **suggest** | 预读 → 展示分析 → **确认或改选** → 策略写入 knowledge；续跑复用 |
 | **balanced** | 固定：Flash 抽 + Pro 结/审 high；页码稀可升 max 再审 |
 | **quality** | 固定：Pro 抽+thinking；结/审 max |
 
-**auto 机制（简）**：
+**suggest 机制（简）**：
 
 1. 抽样页 → Flash 预读打分  
 2. 代码映射（成本硬闸 + noise/terms）  
@@ -115,7 +117,7 @@ book_analysis/                 # 或 --out-dir
 
 **抽取会刻意跳过**（代码硬闸 + 中英线索）：整页目录、纯参考文献表、书末索引、作者简介/封底营销、版权/空白等；正文里的简短文献引用仍会抽。目录页不会按标题扩写成定义。  
 
-**auto**：难书偏 Pro/max，清晰书可 Flash 抽 + high 总结；决议在 knowledge 的 `meta` 里，续跑不重复预读。  
+**suggest**：难书偏 Pro/max，清晰书可 Flash 抽 + high 总结；决议在 knowledge 的 `meta` 里，续跑不重复预读。  
 
 ## 重复执行
 
